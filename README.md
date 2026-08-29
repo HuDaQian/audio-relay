@@ -18,12 +18,12 @@ for Spotify.
 
 ```
 Laptop (Windows/Linux)                    Phone (Android)
-┌─────────────────────────┐               ┌───────────────────────────┐
-│ Loopback capture         │   UDP (PCM)   │ UDP receiver → jitter buf │
+┌──────────────────────────┐               ┌────────────────────────────┐
+│ Loopback capture         │   UDP (PCM)   │ UDP receiver → jitter buf  │
 │  → framer/sequencer      │──────────────▶│  → AudioTrack (USAGE_MEDIA)│
-│ TCP control (pairing,    │◀─────────────▶│  → routed to your BT      │
+│ TCP control (pairing,    │◀─────────────▶│  → routed to your BT       │
 │  heartbeat, reconnect)   │   TCP + mDNS  │    device by Android       │
-└─────────────────────────┘               └───────────────────────────┘
+└──────────────────────────┘               └────────────────────────────┘
 ```
 
 ## Screenshots
