@@ -1,28 +1,23 @@
-# audio-relay
+# audio-relay (Flutter Edition)
 
-Low-latency desktop → Android audio relay, played back through whatever
-Bluetooth device your phone already has connected. The desktop side runs on
-Windows (WASAPI loopback capture) or Linux (PulseAudio/PipeWire monitor
-capture).
+Low-latency Desktop (macOS / Windows / Linux) → Android audio relay, played back through whatever
+Bluetooth device your phone already has connected. 
 
-Because the laptop keeps playing while it relays, a pair of headphones on
-the laptop and another on the phone both hear the same audio — shared
-listening with nothing to set up. See the
-[user guide](docs/user-guide.md#listening-on-two-headsets-at-once).
-
-No admin rights. No virtual audio driver. No cloud service. Your phone stays
-the Bluetooth endpoint — this project just gets your laptop's audio to it
-over the local network (Wi-Fi or the phone's own hotspot) so Android's normal
-audio routing can send it on to your earbuds/speaker exactly like it would
-for Spotify.
+- **Desktop (macOS / Windows / Linux)**:
+  - **macOS**: Native `ScreenCaptureKit` loopback audio capture (PCM 48kHz Stereo 16-bit) with dynamic non-interleaved conversion.
+  - **USB / ADB Fast Tunneling**: Built-in automatic `adb reverse` supervisor (`tcp:45108` & `tcp:45109`) for zero-latency, rock-solid cable streaming.
+  - **LAN / Wi-Fi**: UDP low-latency transport with ChaCha20-Poly1305 encryption and dynamic 6-digit pairing code verification.
+- **Android**:
+  - Flutter Material 3 Dashboard.
+  - Native Foreground Audio Service with `AudioTrack` low-latency mode (`PERFORMANCE_MODE_LOW_LATENCY`), dynamic jitter buffer, and audio level metering.
 
 ```
-Laptop (Windows/Linux)                    Phone (Android)
+macOS / Desktop                           Android Phone
 ┌──────────────────────────┐               ┌────────────────────────────┐
-│ Loopback capture         │   UDP (PCM)   │ UDP receiver → jitter buf  │
-│  → framer/sequencer      │──────────────▶│  → AudioTrack (USAGE_MEDIA)│
-│ TCP control (pairing,    │◀─────────────▶│  → routed to your BT       │
-│  heartbeat, reconnect)   │   TCP + mDNS  │    device by Android       │
+│ ScreenCaptureKit         │   TCP / UDP   │ Low-Latency Audio Receiver │
+│  → PCM 48kHz Stereo 16bit│──────────────▶│  → Jitter Buffer           │
+│ TCP 45108 (Control/Pair) │◀─────────────▶│  → AudioTrack (Low Latency)│
+│ TCP 45109 / UDP 45108    │   ADB / Wi-Fi │  → Bluetooth Earbuds / A2DP│
 └──────────────────────────┘               └────────────────────────────┘
 ```
 
