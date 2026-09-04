@@ -28,6 +28,7 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> is_running_{false};
     std::atomic<bool> should_stop_{false};
+    HANDLE stop_event_ = nullptr;
 
     IMMDeviceEnumerator* enumerator_ = nullptr;
     IMMDevice* device_ = nullptr;

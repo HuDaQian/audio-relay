@@ -50,6 +50,7 @@ private:
     void SendAudioFrame(const std::vector<uint8_t>& pcm);
     void LoadConfig();
     void SaveConfig();
+    void GenerateNewPairCodeLocked();
 
     mutable std::mutex pair_code_mutex_;
     std::string pair_code_;

@@ -9,10 +9,16 @@
 
 namespace audio_relay {
 
-WasapiCapture::WasapiCapture() = default;
+WasapiCapture::WasapiCapture() {
+    stop_event_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+}
 
 WasapiCapture::~WasapiCapture() {
     Stop();
+    if (stop_event_) {
+        CloseHandle(stop_event_);
+        stop_event_ = nullptr;
+    }
 }
 
 bool WasapiCapture::Start(AudioChunkCallback callback) {
@@ -22,6 +28,9 @@ bool WasapiCapture::Start(AudioChunkCallback callback) {
 
     callback_ = std::move(callback);
     should_stop_.store(false);
+    if (stop_event_) {
+        ResetEvent(stop_event_);
+    }
 
     worker_thread_ = std::thread(&WasapiCapture::CaptureLoop, this);
     return true;
@@ -29,6 +38,9 @@ bool WasapiCapture::Start(AudioChunkCallback callback) {
 
 void WasapiCapture::Stop() {
     should_stop_.store(true);
+    if (stop_event_) {
+        SetEvent(stop_event_);
+    }
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
@@ -74,12 +86,12 @@ void WasapiCapture::CaptureLoop() {
         return;
     }
 
-    // 4. Initialize in shared loopback mode
-    // 10ms = 100,000 hns (100ns units)
+    // 4. Initialize in shared loopback mode with event-driven callback
+    // 20ms buffer duration
     REFERENCE_TIME hnsBufferDuration = 200000; // 20ms
     hr = audio_client_->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         hnsBufferDuration,
         0,
         mix_format_,
@@ -95,9 +107,31 @@ void WasapiCapture::CaptureLoop() {
         return;
     }
 
+    HANDLE hAudioEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!hAudioEvent) {
+        CoTaskMemFree(mix_format_); mix_format_ = nullptr;
+        audio_client_->Release(); audio_client_ = nullptr;
+        device_->Release(); device_ = nullptr;
+        enumerator_->Release(); enumerator_ = nullptr;
+        if (co_initialized) CoUninitialize();
+        return;
+    }
+
+    hr = audio_client_->SetEventHandle(hAudioEvent);
+    if (FAILED(hr)) {
+        CloseHandle(hAudioEvent);
+        CoTaskMemFree(mix_format_); mix_format_ = nullptr;
+        audio_client_->Release(); audio_client_ = nullptr;
+        device_->Release(); device_ = nullptr;
+        enumerator_->Release(); enumerator_ = nullptr;
+        if (co_initialized) CoUninitialize();
+        return;
+    }
+
     // 5. Get capture client
     hr = audio_client_->GetService(__uuidof(IAudioCaptureClient), (void**)&capture_client_);
     if (FAILED(hr)) {
+        CloseHandle(hAudioEvent);
         CoTaskMemFree(mix_format_); mix_format_ = nullptr;
         audio_client_->Release(); audio_client_ = nullptr;
         device_->Release(); device_ = nullptr;
@@ -113,6 +147,7 @@ void WasapiCapture::CaptureLoop() {
     hr = audio_client_->Start();
     if (FAILED(hr)) {
         if (hTask) AvRevertMmThreadCharacteristics(hTask);
+        CloseHandle(hAudioEvent);
         capture_client_->Release(); capture_client_ = nullptr;
         CoTaskMemFree(mix_format_); mix_format_ = nullptr;
         audio_client_->Release(); audio_client_ = nullptr;
@@ -134,15 +169,22 @@ void WasapiCapture::CaptureLoop() {
     std::vector<uint8_t> pcm_accum;
     pcm_accum.reserve(4096);
 
+    HANDLE wait_handles[2] = { stop_event_, hAudioEvent };
+
     while (!should_stop_.load()) {
+        DWORD wait_res = WaitForMultipleObjects(2, wait_handles, FALSE, 1000);
+        if (wait_res == WAIT_OBJECT_0) {
+            // stop_event_ signaled
+            break;
+        }
+        if (wait_res != WAIT_OBJECT_0 + 1) {
+            // Timeout or error; continue checking should_stop_
+            continue;
+        }
+
         UINT32 packetLength = 0;
         hr = capture_client_->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) break;
-
-        if (packetLength == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
 
         while (packetLength > 0 && !should_stop_.load()) {
             BYTE* pData = nullptr;
@@ -216,6 +258,7 @@ void WasapiCapture::CaptureLoop() {
 
     audio_client_->Stop();
     if (hTask) AvRevertMmThreadCharacteristics(hTask);
+    CloseHandle(hAudioEvent);
 
     capture_client_->Release(); capture_client_ = nullptr;
     CoTaskMemFree(mix_format_); mix_format_ = nullptr;

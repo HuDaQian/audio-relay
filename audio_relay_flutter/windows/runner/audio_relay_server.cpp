@@ -17,6 +17,17 @@ static void GetSecureRandomBytes(uint8_t* buf, size_t len) {
     BCryptGenRandom(nullptr, (PUCHAR)buf, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
+static std::string GenerateSixDigitCodeSecure() {
+    uint32_t val = 0;
+    do {
+        GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
+    } while (val >= 4294000000ULL);
+    uint32_t code_num = val % 1000000;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%06u", code_num);
+    return std::string(buf);
+}
+
 // Simple JSON extraction helpers
 std::string ExtractJsonString(const std::string& json, const std::string& key) {
     std::string needle = "\"" + key + "\"";
@@ -158,18 +169,14 @@ void WindowsAudioRelayServer::SaveConfig() {
     file.close();
 }
 
-void WindowsAudioRelayServer::GenerateNewPairCode() {
-    uint32_t val = 0;
-    do {
-        GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
-    } while (val >= 4294000000ULL);
-    uint32_t code_num = val % 1000000;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%06u", code_num);
-
-    std::lock_guard<std::mutex> lock(pair_code_mutex_);
-    pair_code_ = buf;
+void WindowsAudioRelayServer::GenerateNewPairCodeLocked() {
+    pair_code_ = GenerateSixDigitCodeSecure();
     pair_code_created_at_ = std::chrono::steady_clock::now();
+}
+
+void WindowsAudioRelayServer::GenerateNewPairCode() {
+    std::lock_guard<std::mutex> lock(pair_code_mutex_);
+    GenerateNewPairCodeLocked();
 }
 
 std::string WindowsAudioRelayServer::GetPairCode() {
@@ -177,15 +184,7 @@ std::string WindowsAudioRelayServer::GetPairCode() {
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - pair_code_created_at_).count();
     if (elapsed > 300 || pair_code_.empty()) {
-        uint32_t val = 0;
-        do {
-            GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
-        } while (val >= 4294000000ULL);
-        uint32_t code_num = val % 1000000;
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%06u", code_num);
-        pair_code_ = buf;
-        pair_code_created_at_ = std::chrono::steady_clock::now();
+        GenerateNewPairCodeLocked();
     }
     return pair_code_;
 }
@@ -368,25 +367,22 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 }
             } else if (type == "PAIR_REQUEST") {
                 std::string current_pair_code;
+                bool is_expired = false;
                 {
                     std::lock_guard<std::mutex> lock(pair_code_mutex_);
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - pair_code_created_at_).count();
                     if (elapsed > 300 || pair_code_.empty()) {
-                        uint32_t val = 0;
-                        do {
-                            GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
-                        } while (val >= 4294000000ULL);
-                        uint32_t code_num = val % 1000000;
-                        char buf[16];
-                        snprintf(buf, sizeof(buf), "%06u", code_num);
-                        pair_code_ = buf;
-                        pair_code_created_at_ = std::chrono::steady_clock::now();
-
-                        SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"code_expired\"}");
-                        continue;
+                        GenerateNewPairCodeLocked();
+                        is_expired = true;
+                    } else {
+                        current_pair_code = pair_code_;
                     }
-                    current_pair_code = pair_code_;
+                }
+
+                if (is_expired) {
+                    SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"code_expired\"}");
+                    continue;
                 }
 
                 // Protocol v2: proof = HMAC-SHA256(code, phone_device_id || nonce_from_HELLO_ACK)
@@ -772,13 +768,37 @@ void WindowsAudioRelayServer::MdnsLoop() {
         uint8_t a_meta[] = { 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04 };
         packet.insert(packet.end(), a_meta, a_meta + sizeof(a_meta));
 
-        // Get local IP
+        // Get local LAN IP (skip loopback and prefer private subnets 192.168.x.x, 10.x.x.x, 172.16-31.x.x)
         uint32_t local_ip = INADDR_ANY;
         char host_name[256];
         if (gethostname(host_name, sizeof(host_name)) == 0) {
             hostent* he = gethostbyname(host_name);
-            if (he && he->h_addr_list[0]) {
-                local_ip = *(uint32_t*)he->h_addr_list[0];
+            if (he && he->h_addr_list) {
+                uint32_t candidate = INADDR_ANY;
+                for (int i = 0; he->h_addr_list[i] != nullptr; ++i) {
+                    uint32_t ip = *(uint32_t*)he->h_addr_list[i];
+                    uint8_t b0 = (uint8_t)(ip & 0xFF);
+                    uint8_t b1 = (uint8_t)((ip >> 8) & 0xFF);
+                    if (b0 == 127) {
+                        continue; // Skip loopback
+                    }
+                    if (b0 == 192 && b1 == 168) {
+                        candidate = ip;
+                        break; // Highest preference: common home LAN
+                    }
+                    if (b0 == 10) {
+                        candidate = ip;
+                    } else if (b0 == 172 && (b1 >= 16 && b1 <= 31) && candidate == INADDR_ANY) {
+                        candidate = ip;
+                    } else if (candidate == INADDR_ANY) {
+                        candidate = ip;
+                    }
+                }
+                if (candidate != INADDR_ANY) {
+                    local_ip = candidate;
+                } else if (he->h_addr_list[0]) {
+                    local_ip = *(uint32_t*)he->h_addr_list[0];
+                }
             }
         }
         packet.push_back((uint8_t)(local_ip & 0xFF));

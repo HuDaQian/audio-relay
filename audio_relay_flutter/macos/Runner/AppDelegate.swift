@@ -421,20 +421,32 @@ class MacAudioRelayServer {
     }
 
     func triggerStartCapture() {
-        guard !isCapturing else { return }
+        stateLock.lock()
+        if _isCapturing {
+            stateLock.unlock()
+            return
+        }
+        _isCapturing = true
+        stateLock.unlock()
+
         capture.onAudioChunk = { [weak self] chunk in
             self?.sendAudioFrame(pcm: chunk)
         }
         Task {
             do {
                 try await capture.start()
-                self.isCapturing = true
                 os_log("ScreenCaptureKit audio capture started successfully")
             } catch {
                 os_log("Failed to start ScreenCaptureKit: %{public}@", error.localizedDescription)
-                self.isCapturing = false
+                self.setCapturingState(false)
             }
         }
+    }
+
+    private func setCapturingState(_ state: Bool) {
+        stateLock.lock()
+        _isCapturing = state
+        stateLock.unlock()
     }
 
     private func startCapture() {
