@@ -234,6 +234,7 @@ class MacAudioRelayServer {
     private var clientDeviceId: String = ""
     private var pairedKeys: [String: SymmetricKey] = [:]
     private var controlBuffer: String = ""
+    private let stateLock = NSLock()
 
     var onStatusChanged: ((String, String?) -> Void)?
 
@@ -314,9 +315,20 @@ class MacAudioRelayServer {
         adbTimer?.invalidate()
         tcpListener?.cancel()
         tcpAudioListener?.cancel()
-        activeControlConnection?.cancel()
-        activeUdpConnection?.cancel()
-        activeAudioTcpConnection?.cancel()
+        stateLock.lock()
+        let ctrl = activeControlConnection
+        activeControlConnection = nil
+        let udp = activeUdpConnection
+        activeUdpConnection = nil
+        let audioTcp = activeAudioTcpConnection
+        activeAudioTcpConnection = nil
+        sessionKey = nil
+        sessionId = nil
+        stateLock.unlock()
+
+        ctrl?.cancel()
+        udp?.cancel()
+        audioTcp?.cancel()
         Task {
             await capture.stop()
         }
@@ -502,12 +514,20 @@ class MacAudioRelayServer {
             let t = json["t"] as? Int64 ?? 0
             sendJson(["type": "PONG", "t": t], to: conn)
         case "BYE":
-            activeControlConnection?.cancel()
+            stateLock.lock()
+            let ctrl = activeControlConnection
             activeControlConnection = nil
-            activeUdpConnection?.cancel()
+            let udp = activeUdpConnection
             activeUdpConnection = nil
-            activeAudioTcpConnection?.cancel()
+            let audioTcp = activeAudioTcpConnection
             activeAudioTcpConnection = nil
+            sessionKey = nil
+            sessionId = nil
+            stateLock.unlock()
+
+            ctrl?.cancel()
+            udp?.cancel()
+            audioTcp?.cancel()
             onStatusChanged?("listening", nil)
         default:
             break
@@ -517,13 +537,17 @@ class MacAudioRelayServer {
     private func handleHello(_ json: [String: Any], conn: NWConnection) {
         let clientName = json["device_name"] as? String ?? "Android"
         let clientAudioPort = json["audio_port"] as? Int ?? 45108
-        clientDeviceId = json["device_id"] as? String ?? ""
+        let reqDevId = json["device_id"] as? String ?? ""
 
         var nonceBytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, 8, &nonceBytes)
-        currentNonce = nonceBytes.map { String(format: "%02x", $0) }.joined()
+        let generatedNonce = nonceBytes.map { String(format: "%02x", $0) }.joined()
 
+        stateLock.lock()
+        clientDeviceId = reqDevId
+        currentNonce = generatedNonce
         let isPaired = (pairedKeys[clientDeviceId] != nil)
+        stateLock.unlock()
 
         let ack: [String: Any] = [
             "type": "HELLO_ACK",
@@ -531,7 +555,7 @@ class MacAudioRelayServer {
             "device_id": deviceId,
             "device_name": deviceName,
             "paired": isPaired,
-            "nonce": currentNonce
+            "nonce": generatedNonce
         ]
         sendJson(ack, to: conn)
 
@@ -539,7 +563,10 @@ class MacAudioRelayServer {
             let udpEndpoint = NWEndpoint.hostPort(host: host, port: NWEndpoint.Port(rawValue: UInt16(clientAudioPort))!)
             let udpConn = NWConnection(to: udpEndpoint, using: .udp)
             udpConn.start(queue: .global())
+            stateLock.lock()
+            self.activeUdpConnection?.cancel()
             self.activeUdpConnection = udpConn
+            stateLock.unlock()
         }
 
         onStatusChanged?("pairing", clientName)
@@ -547,7 +574,13 @@ class MacAudioRelayServer {
 
     private func handlePairRequest(_ json: [String: Any], conn: NWConnection) {
         let clientProof = json["proof"] as? String ?? ""
-        let expectedMsg = (clientDeviceId + currentNonce).data(using: .utf8)!
+
+        stateLock.lock()
+        let currentClientDevId = clientDeviceId
+        let nonce = currentNonce
+        stateLock.unlock()
+
+        let expectedMsg = (currentClientDevId + nonce).data(using: .utf8)!
         let pairCodeKey = SymmetricKey(data: pairCode.data(using: .utf8)!)
 
         guard let proofData = dataFromHex(clientProof),
@@ -556,13 +589,12 @@ class MacAudioRelayServer {
             return
         }
 
-        self.sequence = 0
         var sessIdBytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, 8, &sessIdBytes)
-        self.sessionId = Data(sessIdBytes)
+        let newSessionId = Data(sessIdBytes)
         let sessIdHex = sessIdBytes.map { String(format: "%02x", $0) }.joined()
 
-        let salt = (clientDeviceId + deviceId).data(using: .utf8)!
+        let salt = (currentClientDevId + deviceId).data(using: .utf8)!
         let codeData = pairCode.data(using: .utf8)!
         let prk = SymmetricKey(data: HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: codeData),
@@ -570,9 +602,14 @@ class MacAudioRelayServer {
             info: "audio-relay-session-v1".data(using: .utf8)!,
             outputByteCount: 32
         ))
+
+        stateLock.lock()
+        self.sequence = 0
+        self.sessionId = newSessionId
         self.sessionKey = prk
-        pairedKeys[clientDeviceId] = prk
+        pairedKeys[currentClientDevId] = prk
         saveConfig()
+        stateLock.unlock()
 
         let ok: [String: Any] = [
             "type": "PAIR_OK",
@@ -592,29 +629,38 @@ class MacAudioRelayServer {
     }
 
     private func handleRepair(_ json: [String: Any], conn: NWConnection) {
-        let reqDeviceId = json["device_id"] as? String ?? clientDeviceId
-        guard let savedKey = pairedKeys[reqDeviceId] else {
+        stateLock.lock()
+        let fallbackDevId = clientDeviceId
+        let nonce = currentNonce
+        let reqDeviceId = json["device_id"] as? String ?? fallbackDevId
+        let savedKey = pairedKeys[reqDeviceId]
+        stateLock.unlock()
+
+        guard let key = savedKey else {
             // Key not found or expired; reject repair so client prompts for pairing code!
             sendJson(["type": "PAIR_FAIL", "reason": "key_expired_or_not_found"], to: conn)
             return
         }
 
         let clientProof = json["proof"] as? String ?? ""
-        let expectedMsg = (reqDeviceId + currentNonce).data(using: .utf8)!
+        let expectedMsg = (reqDeviceId + nonce).data(using: .utf8)!
 
         guard let proofData = dataFromHex(clientProof),
-              HMAC<SHA256>.isValidAuthenticationCode(proofData, authenticating: expectedMsg, using: savedKey) else {
+              HMAC<SHA256>.isValidAuthenticationCode(proofData, authenticating: expectedMsg, using: key) else {
             sendJson(["type": "PAIR_FAIL", "reason": "invalid_proof"], to: conn)
             return
         }
 
-        self.sequence = 0
-        self.sessionKey = savedKey
-
         var sessIdBytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, 8, &sessIdBytes)
-        self.sessionId = Data(sessIdBytes)
+        let newSessionId = Data(sessIdBytes)
         let sessIdHex = sessIdBytes.map { String(format: "%02x", $0) }.joined()
+
+        stateLock.lock()
+        self.sequence = 0
+        self.sessionKey = key
+        self.sessionId = newSessionId
+        stateLock.unlock()
 
         sendJson(["type": "PAIR_OK", "session_id": sessIdHex], to: conn)
         sendJson(["type": "CAPABILITIES", "sample_rate": 48000, "channels": 2], to: conn)
@@ -630,16 +676,23 @@ class MacAudioRelayServer {
     }
 
     private func sendAudioFrame(pcm: Data) {
+        stateLock.lock()
         guard let key = sessionKey, let sessId = sessionId else {
+            stateLock.unlock()
             return
         }
 
         sequence &+= 1
+        let seq = sequence
+        let udpConn = activeUdpConnection
+        let tcpConn = activeAudioTcpConnection
+        stateLock.unlock()
+
         let tsMs = UInt32(truncatingIfNeeded: UInt64(ProcessInfo.processInfo.systemUptime * 1000))
 
         var header = Data(count: 13)
         header[0] = 0x00
-        var seqBE = sequence.bigEndian
+        var seqBE = seq.bigEndian
         withUnsafeBytes(of: &seqBE) { header.replaceSubrange(1..<5, with: $0) }
         var tsBE = tsMs.bigEndian
         withUnsafeBytes(of: &tsBE) { header.replaceSubrange(5..<9, with: $0) }
@@ -661,22 +714,22 @@ class MacAudioRelayServer {
         datagram.append(sealedBox.ciphertext)
         datagram.append(sealedBox.tag)
 
-        if sequence % 100 == 0 {
-            os_log("Relay sent frame #%d (%d bytes PCM -> %d bytes encrypted)", sequence, pcm.count, datagram.count)
+        if seq % 100 == 0 {
+            os_log("Relay sent frame #%d (%d bytes PCM -> %d bytes encrypted)", seq, pcm.count, datagram.count)
         }
 
         // 1. Send to UDP client (if LAN / Wi-Fi)
-        if let udpConn = activeUdpConnection {
-            udpConn.send(content: datagram, completion: .idempotent)
+        if let udp = udpConn {
+            udp.send(content: datagram, completion: .idempotent)
         }
 
         // 2. Send to TCP client (if USB cable / ADB reverse) with 2-byte length prefix
-        if let tcpConn = activeAudioTcpConnection {
+        if let tcp = tcpConn {
             var lengthPrefixed = Data(count: 2)
             var lenBE = UInt16(datagram.count).bigEndian
             withUnsafeBytes(of: &lenBE) { lengthPrefixed.replaceSubrange(0..<2, with: $0) }
             lengthPrefixed.append(datagram)
-            tcpConn.send(content: lengthPrefixed, completion: .idempotent)
+            tcp.send(content: lengthPrefixed, completion: .idempotent)
         }
     }
 }

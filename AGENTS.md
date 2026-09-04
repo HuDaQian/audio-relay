@@ -6,70 +6,58 @@ guide; `CLAUDE.md` just points here so Claude Code picks it up automatically.
 
 ## What this project is
 
-A two-sided relay: a Rust desktop app (Windows via WASAPI loopback, Linux via
-PulseAudio's Simple API against each sink's `.monitor` source) captures
-system audio and streams it over the LAN to a Kotlin Android app, which
-plays it back through whatever Bluetooth device is already connected. Full
-design rationale is in `docs/architecture.md`; the phased build plan is in
-`docs/roadmap.md`; the wire format is the single source of truth in
-`protocol-spec.md`.
+A cross-platform audio relay built on Flutter with platform-native capture and playback:
+- **macOS Desktop**: Native `ScreenCaptureKit` loopback capture (macOS 13+) in Swift.
+- **Windows Desktop**: Native `WASAPI` loopback capture in C++ (`windows/runner/`).
+- **Android App**: Kotlin foreground audio service with low-latency `AudioTrack` (`PERFORMANCE_MODE_LOW_LATENCY`), dynamic jitter buffer, and Bluetooth playback.
+- **USB / Cable**: Automated `adb reverse` tunneling on `tcp:45108` and `tcp:45109`.
+- **LAN / Wi-Fi**: UDP low-latency transport, ChaCha20-Poly1305 encryption, and mDNS discovery.
 
-**Read `protocol-spec.md` before touching anything in `desktop-app/src/protocol/`
-or `android-app/.../network/`.** The two apps do not share code (different
-languages, different platforms) — the spec is what keeps them compatible.
-If you change the wire format, update the spec first, bump its version note,
-then update both implementations in the same PR.
+The wire format and control state machine are specified in `protocol-spec.md` (v2).
 
 ## Repo layout
 
 ```
-desktop-app/    Rust binary — capture, protocol, network, minimal UI
-android-app/    Kotlin/Gradle app — discovery, network, audio, foreground service, UI
-protocol-spec.md   Wire format + control messages (canonical)
-docs/           Architecture, roadmap, latency budget
+audio_relay_flutter/    Flutter app — unified codebase
+  android/              Android runner & Kotlin native audio playback service
+  macos/                macOS runner & Swift ScreenCaptureKit capture server
+  windows/              Windows runner & C++ WASAPI capture server + mDNS
+  lib/                  Flutter UI (Material 3 dashboard, pair screens, settings)
+protocol-spec.md        Wire format + control messages (canonical)
+docs/                   Architecture, roadmap, latency budget
+.github/workflows/      CI automation for Android APK and Windows binary
 ```
 
 ## Build / test / lint commands
 
-### desktop-app (Rust)
+### Flutter App (all platforms)
 
 ```sh
-cd desktop-app
-cargo build              # debug build
-cargo test                # unit tests (protocol/config/network logic — platform-independent)
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cd audio_relay_flutter
+flutter pub get
+flutter test
 ```
 
-Note: `src/capture/` has one real backend per supported OS — `windows_impl`
-behind `#[cfg(target_os = "windows")]` (WASAPI) and `linux_impl` behind
-`#[cfg(target_os = "linux")]` (PulseAudio's Simple API, requires
-`libpulse-dev`/equivalent at build time) — plus a stub for anything else. On
-Linux, `cargo build`/`test` compile and run the real Linux capture backend
-alongside protocol/network/config; on any other platform they still compile
-and run everything except capture, which is intentional so CI and
-contributors without a matching OS can validate most of the codebase. Any
-WASAPI-path change needs a Windows machine (or the `desktop-app-ci` job's
-`windows-latest` run) to actually verify; any PulseAudio-path change is
-compile/lint-verified on Linux but still needs a machine with a real
-PulseAudio/PipeWire server running to verify audio actually comes out — see
-`docs/roadmap.md` Phase 0.
-
-### android-app (Kotlin)
+### Android build
 
 ```sh
-cd android-app
-./gradlew assembleDebug
-./gradlew testDebugUnitTest
-./gradlew lint
-./gradlew ktlintCheck     # if the ktlint plugin is present; otherwise follow AOSP style
+cd audio_relay_flutter
+flutter build apk --release
 ```
 
-Unit tests (jitter buffer, packet parsing, sequence-gap handling) should not
-need an emulator. Anything touching `AudioTrack` routing, `NsdManager`, or
-the foreground service's lifecycle needs a real device or emulator with
-Bluetooth — call this out explicitly in the PR description rather than
-claiming it's verified.
+### macOS build
+
+```sh
+cd audio_relay_flutter
+flutter build macos --release
+```
+
+### Windows build
+
+```sh
+cd audio_relay_flutter
+flutter build windows --release
+```
 
 ## Conventions
 

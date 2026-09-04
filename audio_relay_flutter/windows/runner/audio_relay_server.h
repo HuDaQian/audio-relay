@@ -43,6 +43,7 @@ private:
     void HandleControlClient(SOCKET client_sock, sockaddr_in client_addr);
     void TcpAudioLoop();
     void AdbSupervisorLoop();
+    void MdnsLoop();
 
     void SendJson(SOCKET sock, const std::string& json_str);
     void SendAudioFrame(const std::vector<uint8_t>& pcm);
@@ -52,8 +53,6 @@ private:
     std::string pair_code_;
     std::string device_name_;
     std::string device_id_;
-    std::string current_nonce_;
-    std::string client_device_id_;
 
     std::vector<uint8_t> session_id_;
     std::vector<uint8_t> session_key_;
@@ -68,11 +67,13 @@ private:
     std::thread tcp_control_thread_;
     std::thread tcp_audio_thread_;
     std::thread adb_thread_;
+    std::thread mdns_thread_;
 
     SOCKET tcp_control_listen_sock_{INVALID_SOCKET};
     SOCKET tcp_audio_listen_sock_{INVALID_SOCKET};
     SOCKET active_audio_tcp_sock_{INVALID_SOCKET};
     SOCKET udp_sock_{INVALID_SOCKET};
+    SOCKET mdns_sock_{INVALID_SOCKET};
 
     sockaddr_in active_udp_addr_{};
     bool has_active_udp_{false};

@@ -63,46 +63,46 @@ fine for video/music/meetings and not intended for competitive gaming.
 
 ```
 audio-relay/
-├── desktop-app/       # Rust — loopback capture (WASAPI/PulseAudio), network, control
-├── android-app/       # Kotlin — receiver, jitter buffer, playback, service
-├── protocol-spec.md   # Canonical wire protocol — keep both apps in sync
+├── audio_relay_flutter/ # Flutter application
+│   ├── android/         # Android runner & Kotlin native audio playback service
+│   ├── macos/           # macOS runner & Swift ScreenCaptureKit capture server
+│   ├── windows/         # Windows runner & C++ WASAPI capture server + mDNS
+│   └── lib/             # Cross-platform Flutter UI
+├── protocol-spec.md     # Canonical wire protocol — keep all implementations in sync
+├── .github/workflows/   # CI workflows (Android APK & Windows build)
 └── docs/
-    ├── user-guide.md    # Install, pair, every setting, troubleshooting
+    ├── user-guide.md    # Install, pair, settings, troubleshooting
     ├── architecture.md  # Design rationale, latency budget
-    ├── roadmap.md       # Phased build plan, what's done vs. planned
+    ├── roadmap.md       # Phased build plan
     └── screenshots/
 ```
 
 ## Building
 
-### Desktop app (Rust)
+All platforms are built from within the `audio_relay_flutter` project directory using the standard Flutter toolchain:
 
-Requires the Rust toolchain (stable), and either Windows or Linux (the
-capture backend is WASAPI on Windows, PulseAudio's Simple API on Linux —
-each isolated behind its own `#[cfg(target_os = "...")]` module, so the
-protocol/network/config modules can still be built and unit-tested on any
-OS). Linux additionally needs `libpulse-dev` (or your distro's equivalent)
-at build time; PipeWire distros are covered transparently through their
-`pipewire-pulse` compatibility layer.
+### Prerequisites
+- Flutter SDK (stable channel)
+- Platform toolchain:
+  - **Android**: Android SDK & JDK 17+
+  - **macOS**: Xcode & macOS 13+ SDK
+  - **Windows**: Visual Studio 2022 with C++ Desktop Development
 
-```sh
-cd desktop-app
-cargo build
-cargo test
-```
-
-See [`desktop-app/README.md`](desktop-app/README.md) for details.
-
-### Android app (Kotlin)
-
-Requires Android Studio (or the command-line SDK) with API 34+.
+### Commands
 
 ```sh
-cd android-app
-./gradlew assembleDebug
-```
+cd audio_relay_flutter
+flutter pub get
 
-See [`android-app/README.md`](android-app/README.md) for details.
+# Android APK
+flutter build apk --release
+
+# macOS Application
+flutter build macos --release
+
+# Windows Executable
+flutter build windows --release
+```
 
 ## Contributing
 

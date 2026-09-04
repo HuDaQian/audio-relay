@@ -214,6 +214,7 @@ void WindowsAudioRelayServer::Start() {
     tcp_control_thread_ = std::thread(&WindowsAudioRelayServer::TcpControlLoop, this);
     tcp_audio_thread_ = std::thread(&WindowsAudioRelayServer::TcpAudioLoop, this);
     adb_thread_ = std::thread(&WindowsAudioRelayServer::AdbSupervisorLoop, this);
+    mdns_thread_ = std::thread(&WindowsAudioRelayServer::MdnsLoop, this);
 
     TriggerStartCapture();
 }
@@ -240,10 +241,15 @@ void WindowsAudioRelayServer::Stop() {
         closesocket(udp_sock_);
         udp_sock_ = INVALID_SOCKET;
     }
+    if (mdns_sock_ != INVALID_SOCKET) {
+        closesocket(mdns_sock_);
+        mdns_sock_ = INVALID_SOCKET;
+    }
 
     if (tcp_control_thread_.joinable()) tcp_control_thread_.join();
     if (tcp_audio_thread_.joinable()) tcp_audio_thread_.join();
     if (adb_thread_.joinable()) adb_thread_.join();
+    if (mdns_thread_.joinable()) mdns_thread_.join();
 
     WSACleanup();
 }
@@ -280,6 +286,9 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
     char buffer[2048];
     std::string line_accum;
 
+    std::string local_client_device_id;
+    std::string local_current_nonce;
+
     while (is_running_.load()) {
         int bytes = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
         if (bytes <= 0) break;
@@ -299,17 +308,17 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 std::string client_name = ExtractJsonString(line, "device_name");
                 if (client_name.empty()) client_name = "Android";
                 int client_audio_port = ExtractJsonInt(line, "audio_port", 45108);
-                client_device_id_ = ExtractJsonString(line, "device_id");
+                local_client_device_id = ExtractJsonString(line, "device_id");
 
                 std::random_device rd;
                 std::mt19937_64 gen(rd());
                 uint64_t nonce_val = gen();
-                current_nonce_ = ToHex((const uint8_t*)&nonce_val, 8);
+                local_current_nonce = ToHex((const uint8_t*)&nonce_val, 8);
 
                 bool is_paired = false;
                 {
                     std::lock_guard<std::mutex> lock(net_mutex_);
-                    is_paired = (paired_keys_.find(client_device_id_) != paired_keys_.end());
+                    is_paired = (paired_keys_.find(local_client_device_id) != paired_keys_.end());
                 }
 
                 std::ostringstream oss;
@@ -318,7 +327,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     << "\"device_id\":\"" << device_id_ << "\","
                     << "\"device_name\":\"" << device_name_ << "\","
                     << "\"paired\":" << (is_paired ? "true" : "false") << ","
-                    << "\"nonce\":\"" << current_nonce_ << "\"}";
+                    << "\"nonce\":\"" << local_current_nonce << "\"}";
                 SendJson(client_sock, oss.str());
 
                 {
@@ -337,7 +346,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
 
                 std::string expected_proof = hmac_sha256_hex(
                     (const uint8_t*)pair_code_.data(), pair_code_.size(),
-                    client_device_id_ + current_nonce_
+                    local_client_device_id + local_current_nonce
                 );
 
                 if (!client_proof.empty() && constant_time_eq_str(client_proof, expected_proof)) {
@@ -352,7 +361,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
                         sess_hex = ToHex(session_id_.data(), 8);
 
-                        std::string salt = client_device_id_ + device_id_;
+                        std::string salt = local_client_device_id + device_id_;
                         session_key_.resize(32);
                         hkdf_sha256_32(
                             (const uint8_t*)salt.data(), salt.size(),
@@ -360,7 +369,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                             (const uint8_t*)"audio-relay-session-v1", 22,
                             session_key_.data()
                         );
-                        paired_keys_[client_device_id_] = session_key_;
+                        paired_keys_[local_client_device_id] = session_key_;
                         SaveConfig();
                     }
 
@@ -379,7 +388,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
             } else if (type == "REPAIR") {
                 // Protocol v2: proof = HMAC-SHA256(persisted_key, device_id || nonce_from_HELLO_ACK)
                 std::string req_device_id = ExtractJsonString(line, "device_id");
-                if (req_device_id.empty()) req_device_id = client_device_id_;
+                if (req_device_id.empty()) req_device_id = local_client_device_id;
                 std::string client_proof = ExtractJsonString(line, "proof");
 
                 bool success = false;
@@ -391,7 +400,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     if (it != paired_keys_.end()) {
                         std::string expected_proof = hmac_sha256_hex(
                             it->second.data(), it->second.size(),
-                            req_device_id + current_nonce_
+                            req_device_id + local_current_nonce
                         );
 
                         if (!client_proof.empty() && constant_time_eq_str(client_proof, expected_proof)) {
@@ -432,7 +441,18 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(net_mutex_);
+        has_active_udp_ = false;
+        session_key_.clear();
+        session_id_.clear();
+    }
+
     closesocket(client_sock);
+
+    if (status_callback_) {
+        status_callback_("listening", "");
+    }
 }
 
 void WindowsAudioRelayServer::TcpAudioLoop() {
@@ -473,12 +493,12 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     uint32_t ts_ms = (uint32_t)(elapsed & 0xFFFFFFFF);
 
     // Protocol Header (13 bytes):
-    // [0] = 0x00
+    // [0] = 0x00 (codec_id: 0x00 = raw PCM_S16LE)
     // [1..4] = sequence (big endian)
     // [5..8] = timestamp ms (big endian)
-    // [9] = 0x01 (PCM_S16LE)
-    // [10] = 0x02 (Stereo)
-    // [11..12] = 0x0000 (48000Hz)
+    // [9] = 0x01 (sample_rate_id: 0 = 44100Hz, 1 = 48000Hz)
+    // [10] = 0x02 (channels: 1 = mono, 2 = stereo)
+    // [11..12] = 0x0000 (reserved)
     uint8_t header[13];
     header[0] = 0x00;
     header[1] = (uint8_t)(sequence_ >> 24);
@@ -568,6 +588,192 @@ void WindowsAudioRelayServer::AdbSupervisorLoop() {
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
+// Lightweight DNS-SD / mDNS service announcement responder
+// Advertises _audiorelay._udp.local. on 224.0.0.251:5353
+void WindowsAudioRelayServer::MdnsLoop() {
+    mdns_sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (mdns_sock_ == INVALID_SOCKET) return;
+
+    BOOL reuse = TRUE;
+    setsockopt(mdns_sock_, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = htons(5353);
+
+    if (bind(mdns_sock_, (sockaddr*)&bind_addr, sizeof(bind_addr)) != 0) {
+        closesocket(mdns_sock_);
+        mdns_sock_ = INVALID_SOCKET;
+        return;
+    }
+
+    ip_mreq mreq{};
+    mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    setsockopt(mdns_sock_, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq));
+
+    sockaddr_in mdns_dest{};
+    mdns_dest.sin_family = AF_INET;
+    mdns_dest.sin_addr.s_addr = inet_addr("224.0.0.251");
+    mdns_dest.sin_port = htons(5353);
+
+    auto send_dns_sd_announcement = [this, &mdns_dest]() {
+        if (mdns_sock_ == INVALID_SOCKET) return;
+
+        std::vector<uint8_t> packet;
+        // 1. DNS Header: ID=0, Flags=0x8400 (Authoritative response), QDCOUNT=0, ANCOUNT=4, NSCOUNT=0, ARCOUNT=0
+        uint8_t header[] = {
+            0x00, 0x00, 0x84, 0x00,
+            0x00, 0x00, // QDCOUNT = 0
+            0x00, 0x04, // ANCOUNT = 4 (PTR, SRV, TXT, A)
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00  // ARCOUNT = 0
+        };
+        packet.insert(packet.end(), header, header + sizeof(header));
+
+        auto append_domain = [&packet](const std::string& domain) {
+            size_t start = 0;
+            while (start < domain.size()) {
+                size_t dot = domain.find('.', start);
+                if (dot == std::string::npos) dot = domain.size();
+                size_t len = dot - start;
+                packet.push_back((uint8_t)len);
+                packet.insert(packet.end(), domain.begin() + start, domain.begin() + dot);
+                start = dot + 1;
+            }
+            packet.push_back(0x00);
+        };
+
+        std::string service_type = "_audiorelay._udp.local";
+        std::string instance_name = device_name_ + "." + service_type;
+        std::string target_host = device_name_ + ".local";
+
+        // Record 1: PTR Record: _audiorelay._udp.local -> <instance_name>
+        append_domain(service_type);
+        // Type = PTR (0x000c), Class = IN (0x0001) | Cache-Flush (0x8000)
+        uint8_t ptr_meta[] = { 0x00, 0x0C, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78 }; // TTL = 120s
+        packet.insert(packet.end(), ptr_meta, ptr_meta + sizeof(ptr_meta));
+
+        std::vector<uint8_t> rdata_ptr;
+        {
+            size_t start = 0;
+            while (start < instance_name.size()) {
+                size_t dot = instance_name.find('.', start);
+                if (dot == std::string::npos) dot = instance_name.size();
+                size_t len = dot - start;
+                rdata_ptr.push_back((uint8_t)len);
+                rdata_ptr.insert(rdata_ptr.end(), instance_name.begin() + start, instance_name.begin() + dot);
+                start = dot + 1;
+            }
+            rdata_ptr.push_back(0x00);
+        }
+        uint16_t ptr_rdlen = (uint16_t)rdata_ptr.size();
+        packet.push_back((uint8_t)(ptr_rdlen >> 8));
+        packet.push_back((uint8_t)(ptr_rdlen & 0xFF));
+        packet.insert(packet.end(), rdata_ptr.begin(), rdata_ptr.end());
+
+        // Record 2: SRV Record: <instance_name> -> port 45108, target: <target_host>
+        append_domain(instance_name);
+        uint8_t srv_meta[] = { 0x00, 0x21, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78 }; // TTL = 120s
+        packet.insert(packet.end(), srv_meta, srv_meta + sizeof(srv_meta));
+
+        std::vector<uint8_t> rdata_srv;
+        rdata_srv.push_back(0x00); rdata_srv.push_back(0x00); // Priority = 0
+        rdata_srv.push_back(0x00); rdata_srv.push_back(0x00); // Weight = 0
+        rdata_srv.push_back((uint8_t)(45108 >> 8));
+        rdata_srv.push_back((uint8_t)(45108 & 0xFF)); // Port = 45108
+        {
+            size_t start = 0;
+            while (start < target_host.size()) {
+                size_t dot = target_host.find('.', start);
+                if (dot == std::string::npos) dot = target_host.size();
+                size_t len = dot - start;
+                rdata_srv.push_back((uint8_t)len);
+                rdata_srv.insert(rdata_srv.end(), target_host.begin() + start, target_host.begin() + dot);
+                start = dot + 1;
+            }
+            rdata_srv.push_back(0x00);
+        }
+        uint16_t srv_rdlen = (uint16_t)rdata_srv.size();
+        packet.push_back((uint8_t)(srv_rdlen >> 8));
+        packet.push_back((uint8_t)(srv_rdlen & 0xFF));
+        packet.insert(packet.end(), rdata_srv.begin(), rdata_srv.end());
+
+        // Record 3: TXT Record: id=<device_id>, name=<device_name>, protocol_version=2
+        append_domain(instance_name);
+        uint8_t txt_meta[] = { 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78 }; // TTL = 120s
+        packet.insert(packet.end(), txt_meta, txt_meta + sizeof(txt_meta));
+
+        std::vector<std::string> txt_entries = {
+            "id=" + device_id_,
+            "name=" + device_name_,
+            "protocol_version=2"
+        };
+        std::vector<uint8_t> rdata_txt;
+        for (const auto& entry : txt_entries) {
+            rdata_txt.push_back((uint8_t)entry.size());
+            rdata_txt.insert(rdata_txt.end(), entry.begin(), entry.end());
+        }
+        uint16_t txt_rdlen = (uint16_t)rdata_txt.size();
+        packet.push_back((uint8_t)(txt_rdlen >> 8));
+        packet.push_back((uint8_t)(txt_rdlen & 0xFF));
+        packet.insert(packet.end(), rdata_txt.begin(), rdata_txt.end());
+
+        // Record 4: A Record for target_host
+        append_domain(target_host);
+        uint8_t a_meta[] = { 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04 };
+        packet.insert(packet.end(), a_meta, a_meta + sizeof(a_meta));
+
+        // Get local IP
+        uint32_t local_ip = INADDR_ANY;
+        char host_name[256];
+        if (gethostname(host_name, sizeof(host_name)) == 0) {
+            hostent* he = gethostbyname(host_name);
+            if (he && he->h_addr_list[0]) {
+                local_ip = *(uint32_t*)he->h_addr_list[0];
+            }
+        }
+        packet.push_back((uint8_t)(local_ip & 0xFF));
+        packet.push_back((uint8_t)((local_ip >> 8) & 0xFF));
+        packet.push_back((uint8_t)((local_ip >> 16) & 0xFF));
+        packet.push_back((uint8_t)((local_ip >> 24) & 0xFF));
+
+        sendto(mdns_sock_, (const char*)packet.data(), (int)packet.size(), 0,
+               (sockaddr*)&mdns_dest, sizeof(mdns_dest));
+    };
+
+    // Broadcast immediately on start, and listen for incoming queries
+    send_dns_sd_announcement();
+
+    u_long non_blocking = 1;
+    ioctlsocket(mdns_sock_, FIONBIO, &non_blocking);
+
+    char recv_buf[1500];
+    auto last_announce = std::chrono::steady_clock::now();
+
+    while (is_running_.load()) {
+        sockaddr_in src_addr{};
+        int src_len = sizeof(src_addr);
+        int r = recvfrom(mdns_sock_, recv_buf, sizeof(recv_buf), 0, (sockaddr*)&src_addr, &src_len);
+        if (r > 0) {
+            // Check if query contains _audiorelay
+            std::string q(recv_buf, r);
+            if (q.find("_audiorelay") != std::string::npos) {
+                send_dns_sd_announcement();
+            }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_announce).count() >= 5) {
+            send_dns_sd_announcement();
+            last_announce = now;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 }
 
