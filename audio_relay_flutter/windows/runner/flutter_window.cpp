@@ -4,6 +4,12 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+#include <flutter/method_channel.h>
+#include <flutter/standard_method_codec.h>
+#include <flutter/encodable_value.h>
+#include <shellapi.h>
+#include "audio_relay_server.h"
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -27,6 +33,58 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
+  // Setup desktop MethodChannels
+  auto messenger = flutter_controller_->engine()->messenger();
+  desktop_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+      messenger, "com.audiorelay.flutter/desktop",
+      &flutter::StandardMethodCodec::GetInstance());
+  desktop_events_channel_ = std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
+      messenger, "com.audiorelay.flutter/desktop_events",
+      &flutter::StandardMethodCodec::GetInstance());
+
+  auto& server = audio_relay::WindowsAudioRelayServer::Instance();
+  auto events_chan = desktop_events_channel_;
+  server.SetStatusCallback([events_chan](const std::string& status, const std::string& client_name) {
+    flutter::EncodableMap args;
+    args[flutter::EncodableValue("status")] = flutter::EncodableValue(status);
+    if (!client_name.empty()) {
+      args[flutter::EncodableValue("clientName")] = flutter::EncodableValue(client_name);
+    }
+    events_chan->InvokeMethod("onStatusChanged", std::make_unique<flutter::EncodableValue>(args));
+  });
+
+  server.Start();
+
+  desktop_channel_->SetMethodCallHandler(
+      [](const flutter::MethodCall<flutter::EncodableValue>& call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+        auto& s = audio_relay::WindowsAudioRelayServer::Instance();
+        if (call.method_name() == "getServerInfo") {
+          flutter::EncodableMap res;
+          res[flutter::EncodableValue("pairCode")] = flutter::EncodableValue(s.GetPairCode());
+          res[flutter::EncodableValue("port")] = flutter::EncodableValue(s.GetPort());
+          res[flutter::EncodableValue("deviceName")] = flutter::EncodableValue(s.GetDeviceName());
+          res[flutter::EncodableValue("hasPermission")] = flutter::EncodableValue(s.IsCapturing());
+          result->Success(flutter::EncodableValue(res));
+        } else if (call.method_name() == "checkPermission") {
+          result->Success(flutter::EncodableValue(s.IsCapturing()));
+        } else if (call.method_name() == "requestPermission") {
+          s.TriggerStartCapture();
+          result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "openPermissionSettings") {
+          ShellExecuteA(nullptr, "open", "ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL);
+          result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "startCapture") {
+          s.TriggerStartCapture();
+          result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "regenerateCode") {
+          s.GenerateNewPairCode();
+          result->Success(flutter::EncodableValue(true));
+        } else {
+          result->NotImplemented();
+        }
+      });
+
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
   });
@@ -40,6 +98,10 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  audio_relay::WindowsAudioRelayServer::Instance().Stop();
+  desktop_channel_ = nullptr;
+  desktop_events_channel_ = nullptr;
+
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
