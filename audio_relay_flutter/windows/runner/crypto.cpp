@@ -54,24 +54,6 @@ static const uint32_t K256[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-struct Sha256Ctx {
-    uint32_t state[8];
-    uint64_t count;
-    uint8_t buffer[64];
-};
-
-void sha256_init(Sha256Ctx* ctx) {
-    ctx->state[0] = 0x6a09e667;
-    ctx->state[1] = 0xbb67ae85;
-    ctx->state[2] = 0x3c6ef372;
-    ctx->state[3] = 0xa54ff53a;
-    ctx->state[4] = 0x510e527f;
-    ctx->state[5] = 0x9b05688c;
-    ctx->state[6] = 0x1f83d9ab;
-    ctx->state[7] = 0x5be0cd19;
-    ctx->count = 0;
-}
-
 void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++) {
@@ -102,51 +84,18 @@ void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
-void sha256_update(Sha256Ctx* ctx, const uint8_t* data, size_t len) {
-    size_t buffer_fill = (size_t)(ctx->count % 64);
-    ctx->count += len;
-    size_t i = 0;
-    if (buffer_fill > 0) {
-        size_t to_copy = std::min(len, 64 - buffer_fill);
-        std::memcpy(ctx->buffer + buffer_fill, data, to_copy);
-        i += to_copy;
-        if (buffer_fill + to_copy == 64) {
-            sha256_transform(ctx->state, ctx->buffer);
-        }
-    }
-    for (; i + 64 <= len; i += 64) {
-        sha256_transform(ctx->state, data + i);
-    }
-    if (i < len) {
-        std::memcpy(ctx->buffer, data + i, len - i);
-    }
-}
-
-void sha256_final(Sha256Ctx* ctx, uint8_t hash[32]) {
-    uint8_t pad = 0x80;
-    sha256_update(ctx, &pad, 1);
-    uint8_t zero = 0;
-    while ((ctx->count % 64) != 56) {
-        sha256_update(ctx, &zero, 1);
-    }
-    uint64_t bits = (ctx->count - 1 - (ctx->count % 64 < 56 ? 56 - (ctx->count % 64) : 64 + 56 - (ctx->count % 64))); // exact bit length
-    // More cleanly:
-    uint64_t total_bits = (ctx->count - (ctx->count - (ctx->count - (ctx->count % 64)))) * 8; // we kept exact original byte count before padding
-}
-
 } // anon namespace
 
 void sha256(const uint8_t* data, size_t len, uint8_t hash[32]) {
-    Sha256Ctx ctx;
-    ctx.state[0] = 0x6a09e667; ctx.state[1] = 0xbb67ae85;
-    ctx.state[2] = 0x3c6ef372; ctx.state[3] = 0xa54ff53a;
-    ctx.state[4] = 0x510e527f; ctx.state[5] = 0x9b05688c;
-    ctx.state[6] = 0x1f83d9ab; ctx.state[7] = 0x5be0cd19;
-    ctx.count = len;
+    uint32_t state[8];
+    state[0] = 0x6a09e667; state[1] = 0xbb67ae85;
+    state[2] = 0x3c6ef372; state[3] = 0xa54ff53a;
+    state[4] = 0x510e527f; state[5] = 0x9b05688c;
+    state[6] = 0x1f83d9ab; state[7] = 0x5be0cd19;
 
     size_t i = 0;
     for (; i + 64 <= len; i += 64) {
-        sha256_transform(ctx.state, data + i);
+        sha256_transform(state, data + i);
     }
     uint8_t block[64];
     size_t rem = len - i;
@@ -154,7 +103,7 @@ void sha256(const uint8_t* data, size_t len, uint8_t hash[32]) {
     block[rem++] = 0x80;
     if (rem > 56) {
         std::memset(block + rem, 0, 64 - rem);
-        sha256_transform(ctx.state, block);
+        sha256_transform(state, block);
         rem = 0;
     }
     std::memset(block + rem, 0, 56 - rem);
@@ -162,13 +111,13 @@ void sha256(const uint8_t* data, size_t len, uint8_t hash[32]) {
     for (int b = 7; b >= 0; b--) {
         block[56 + (7 - b)] = (uint8_t)(bits >> (b * 8));
     }
-    sha256_transform(ctx.state, block);
+    sha256_transform(state, block);
 
     for (int j = 0; j < 8; j++) {
-        hash[j * 4]     = (uint8_t)(ctx.state[j] >> 24);
-        hash[j * 4 + 1] = (uint8_t)(ctx.state[j] >> 16);
-        hash[j * 4 + 2] = (uint8_t)(ctx.state[j] >> 8);
-        hash[j * 4 + 3] = (uint8_t)(ctx.state[j]);
+        hash[j * 4]     = (uint8_t)(state[j] >> 24);
+        hash[j * 4 + 1] = (uint8_t)(state[j] >> 16);
+        hash[j * 4 + 2] = (uint8_t)(state[j] >> 8);
+        hash[j * 4 + 3] = (uint8_t)(state[j]);
     }
 }
 
@@ -351,7 +300,7 @@ void poly1305_blocks(Poly1305Ctx* ctx, const uint8_t* m, size_t bytes, bool is_f
         ctx->h[1] += ((t0 >> 26) | (t1 << 6)) & 0x3ffffff;
         ctx->h[2] += ((t1 >> 20) | (t2 << 12)) & 0x3ffffff;
         ctx->h[3] += ((t2 >> 14) | (t3 << 18)) & 0x3ffffff;
-        ctx->h[4] += (t3 >> 8);
+        ctx->h[4] += (t3 >> 8) | hibit;
 
         uint64_t d0 = (uint64_t)ctx->h[0] * ctx->r[0] + (uint64_t)ctx->h[1] * (5 * ctx->r[4]) + (uint64_t)ctx->h[2] * (5 * ctx->r[3]) + (uint64_t)ctx->h[3] * (5 * ctx->r[2]) + (uint64_t)ctx->h[4] * (5 * ctx->r[1]);
         uint64_t d1 = (uint64_t)ctx->h[0] * ctx->r[1] + (uint64_t)ctx->h[1] * ctx->r[0] + (uint64_t)ctx->h[2] * (5 * ctx->r[4]) + (uint64_t)ctx->h[3] * (5 * ctx->r[3]) + (uint64_t)ctx->h[4] * (5 * ctx->r[2]);
