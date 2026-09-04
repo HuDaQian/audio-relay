@@ -450,4 +450,34 @@ void chacha20_poly1305_seal(const uint8_t key[32],
     poly1305_finish(&poly, out_tag);
 }
 
+bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t len) {
+    uint8_t result = 0;
+    for (size_t i = 0; i < len; i++) {
+        result |= (a[i] ^ b[i]);
+    }
+    return result == 0;
+}
+
+bool constant_time_eq_str(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    return constant_time_eq(reinterpret_cast<const uint8_t*>(a.data()),
+                            reinterpret_cast<const uint8_t*>(b.data()),
+                            a.size());
+}
+
+std::string hmac_sha256_hex(const uint8_t* key, size_t key_len, const std::string& data) {
+    uint8_t out[32];
+    hmac_sha256(key, key_len, reinterpret_cast<const uint8_t*>(data.data()), data.size(), out);
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string res;
+    res.reserve(64);
+    for (int i = 0; i < 32; i++) {
+        res.push_back(hex_chars[(out[i] >> 4) & 0x0F]);
+        res.push_back(hex_chars[out[i] & 0x0F]);
+    }
+    return res;
+}
+
 } // namespace audio_relay

@@ -233,11 +233,70 @@ class MacAudioRelayServer {
     private var currentNonce: String = ""
     private var clientDeviceId: String = ""
     private var pairedKeys: [String: SymmetricKey] = [:]
+    private var controlBuffer: String = ""
 
     var onStatusChanged: ((String, String?) -> Void)?
 
     private init() {
+        loadConfig()
         generateNewPairCode()
+    }
+
+    private var configURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("AudioRelay", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("config.json")
+    }
+
+    private func loadConfig() {
+        guard let data = try? Data(contentsOf: configURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+
+        if let savedId = json["device_id"] as? String, !savedId.isEmpty {
+            self.deviceId = savedId
+        }
+
+        if let keys = json["paired_keys"] as? [String: String] {
+            for (id, hexKey) in keys {
+                if let keyData = dataFromHex(hexKey), keyData.count == 32 {
+                    pairedKeys[id] = SymmetricKey(data: keyData)
+                }
+            }
+        }
+    }
+
+    private func saveConfig() {
+        var keysHex: [String: String] = [:]
+        for (id, symKey) in pairedKeys {
+            let hex = symKey.withUnsafeBytes { ptr in
+                ptr.map { String(format: "%02x", $0) }.joined()
+            }
+            keysHex[id] = hex
+        }
+
+        let dict: [String: Any] = [
+            "device_id": deviceId,
+            "paired_keys": keysHex
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            try? data.write(to: configURL)
+        }
+    }
+
+    private func dataFromHex(_ hex: String) -> Data? {
+        var data = Data()
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            guard let nextIdx = hex.index(idx, offsetBy: 2, limitedBy: hex.endIndex) else { return nil }
+            guard let byte = UInt8(hex[idx..<nextIdx], radix: 16) else { return nil }
+            data.append(byte)
+            idx = nextIdx
+        }
+        return data
     }
 
     func generateNewPairCode() {
@@ -341,12 +400,20 @@ class MacAudioRelayServer {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
             let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            let txtDict = [
+                "id": deviceId,
+                "name": deviceName,
+                "protocol_version": "2"
+            ]
+            let txtData = NetService.data(fromTXTRecord: txtDict.mapValues { $0.data(using: .utf8)! })
+            listener.service = NWListener.Service(name: deviceName, type: "_audiorelay._udp", domain: nil, txtRecord: txtData)
+
             listener.newConnectionHandler = { [weak self] newConn in
                 self?.handleNewControlConnection(newConn)
             }
             listener.stateUpdateHandler = { [weak self] state in
                 if case .ready = state {
-                    os_log("TCP Control Channel listening on port %d", self?.port ?? 45108)
+                    os_log("TCP Control Channel listening on port %d with mDNS", self?.port ?? 45108)
                     self?.onStatusChanged?("listening", nil)
                 }
             }
@@ -378,6 +445,7 @@ class MacAudioRelayServer {
     private func handleNewControlConnection(_ conn: NWConnection) {
         activeControlConnection?.cancel()
         activeControlConnection = conn
+        controlBuffer = ""
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled:
@@ -394,11 +462,13 @@ class MacAudioRelayServer {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] content, _, isComplete, error in
             guard let self = self else { return }
 
-            if let data = content, !data.isEmpty, let string = String(data: data, encoding: .utf8) {
-                for line in string.components(separatedBy: "\n") {
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        self.processControlMessage(trimmed, conn: conn)
+            if let data = content, !data.isEmpty, let chunk = String(data: data, encoding: .utf8) {
+                self.controlBuffer.append(chunk)
+                while let range = self.controlBuffer.range(of: "\n") {
+                    let line = String(self.controlBuffer[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.controlBuffer.removeSubrange(..<range.upperBound)
+                    if !line.isEmpty {
+                        self.processControlMessage(line, conn: conn)
                     }
                 }
             }
@@ -476,6 +546,17 @@ class MacAudioRelayServer {
     }
 
     private func handlePairRequest(_ json: [String: Any], conn: NWConnection) {
+        let clientProof = json["proof"] as? String ?? ""
+        let expectedMsg = (clientDeviceId + currentNonce).data(using: .utf8)!
+        let pairCodeKey = SymmetricKey(data: pairCode.data(using: .utf8)!)
+
+        guard let proofData = dataFromHex(clientProof),
+              HMAC<SHA256>.isValidAuthenticationCode(proofData, authenticating: expectedMsg, using: pairCodeKey) else {
+            sendJson(["type": "PAIR_FAIL", "reason": "invalid_code"], to: conn)
+            return
+        }
+
+        self.sequence = 0
         var sessIdBytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, 8, &sessIdBytes)
         self.sessionId = Data(sessIdBytes)
@@ -491,6 +572,7 @@ class MacAudioRelayServer {
         ))
         self.sessionKey = prk
         pairedKeys[clientDeviceId] = prk
+        saveConfig()
 
         let ok: [String: Any] = [
             "type": "PAIR_OK",
@@ -517,6 +599,16 @@ class MacAudioRelayServer {
             return
         }
 
+        let clientProof = json["proof"] as? String ?? ""
+        let expectedMsg = (reqDeviceId + currentNonce).data(using: .utf8)!
+
+        guard let proofData = dataFromHex(clientProof),
+              HMAC<SHA256>.isValidAuthenticationCode(proofData, authenticating: expectedMsg, using: savedKey) else {
+            sendJson(["type": "PAIR_FAIL", "reason": "invalid_proof"], to: conn)
+            return
+        }
+
+        self.sequence = 0
         self.sessionKey = savedKey
 
         var sessIdBytes = [UInt8](repeating: 0, count: 8)
@@ -543,7 +635,7 @@ class MacAudioRelayServer {
         }
 
         sequence &+= 1
-        let tsMs = UInt32(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000))
+        let tsMs = UInt32(truncatingIfNeeded: UInt64(ProcessInfo.processInfo.systemUptime * 1000))
 
         var header = Data(count: 13)
         header[0] = 0x00

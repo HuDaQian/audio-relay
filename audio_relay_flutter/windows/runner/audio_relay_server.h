@@ -46,6 +46,8 @@ private:
 
     void SendJson(SOCKET sock, const std::string& json_str);
     void SendAudioFrame(const std::vector<uint8_t>& pcm);
+    void LoadConfig();
+    void SaveConfig();
 
     std::string pair_code_;
     std::string device_name_;

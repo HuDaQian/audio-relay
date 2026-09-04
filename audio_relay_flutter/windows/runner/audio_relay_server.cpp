@@ -2,6 +2,7 @@
 #include "crypto.h"
 #include <chrono>
 #include <sstream>
+#include <fstream>
 #include <random>
 #include <iomanip>
 #include <iostream>
@@ -24,7 +25,7 @@ std::string ExtractJsonString(const std::string& json, const std::string& key) {
     return json.substr(pos + 1, end_pos - pos - 1);
 }
 
-int ExtractJsonInt(const std::string& json, const std::string& key, int default_val = 0) {
+int64_t ExtractJsonInt64(const std::string& json, const std::string& key, int64_t default_val = 0) {
     std::string needle = "\"" + key + "\"";
     size_t pos = json.find(needle);
     if (pos == std::string::npos) return default_val;
@@ -34,18 +35,47 @@ int ExtractJsonInt(const std::string& json, const std::string& key, int default_
         pos++;
     }
     try {
-        return std::stoi(json.substr(pos));
+        return std::stoll(json.substr(pos));
     } catch (...) {
         return default_val;
     }
 }
 
+int ExtractJsonInt(const std::string& json, const std::string& key, int default_val = 0) {
+    return (int)ExtractJsonInt64(json, key, default_val);
+}
+
 std::string ToHex(const uint8_t* data, size_t len) {
-    std::ostringstream oss;
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string res;
+    res.reserve(len * 2);
     for (size_t i = 0; i < len; i++) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
+        res.push_back(hex_chars[(data[i] >> 4) & 0x0F]);
+        res.push_back(hex_chars[data[i] & 0x0F]);
     }
-    return oss.str();
+    return res;
+}
+
+std::vector<uint8_t> FromHex(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        std::string byteString = hex.substr(i, 2);
+        uint8_t byte = (uint8_t)strtol(byteString.c_str(), nullptr, 16);
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
+
+std::string GetConfigPath() {
+    char localAppData[MAX_PATH];
+    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return "audio_relay_config.json";
+    }
+    std::string dir = std::string(localAppData) + "\\AudioRelay";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\config.json";
 }
 
 } // anon namespace
@@ -66,15 +96,62 @@ WindowsAudioRelayServer::WindowsAudioRelayServer() {
         device_name_ = "Windows PC";
     }
 
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    uint64_t r1 = gen();
-    uint64_t r2 = gen();
-    device_id_ = "win-" + ToHex((const uint8_t*)&r1, 8) + ToHex((const uint8_t*)&r2, 8);
+    LoadConfig();
+
+    if (device_id_.empty()) {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        uint64_t r1 = gen();
+        uint64_t r2 = gen();
+        device_id_ = "win-" + ToHex((const uint8_t*)&r1, 8) + ToHex((const uint8_t*)&r2, 8);
+        SaveConfig();
+    }
 }
 
 WindowsAudioRelayServer::~WindowsAudioRelayServer() {
     Stop();
+}
+
+void WindowsAudioRelayServer::LoadConfig() {
+    std::ifstream file(GetConfigPath());
+    if (!file.is_open()) return;
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+
+    std::string id = ExtractJsonString(content, "device_id");
+    if (!id.empty()) {
+        device_id_ = id;
+    }
+
+    // Parse simple JSON list for paired_keys
+    // Format: {"device_id":"...", "paired_keys":[{"device_id":"...", "key":"..."}, ...]}
+    size_t pos = 0;
+    while ((pos = content.find("\"device_id\":", pos)) != std::string::npos) {
+        if (pos > 0 && content.substr(0, pos).find("\"paired_keys\"") != std::string::npos) {
+            std::string d_id = ExtractJsonString(content.substr(pos), "device_id");
+            std::string k_hex = ExtractJsonString(content.substr(pos), "key");
+            if (!d_id.empty() && k_hex.size() == 64) {
+                paired_keys_[d_id] = FromHex(k_hex);
+            }
+        }
+        pos += 12;
+    }
+}
+
+void WindowsAudioRelayServer::SaveConfig() {
+    std::ofstream file(GetConfigPath(), std::ios::trunc);
+    if (!file.is_open()) return;
+
+    file << "{\n  \"device_id\": \"" << device_id_ << "\",\n  \"paired_keys\": [\n";
+    size_t idx = 0;
+    for (const auto& pair : paired_keys_) {
+        file << "    {\"device_id\": \"" << pair.first << "\", \"key\": \"" << ToHex(pair.second.data(), pair.second.size()) << "\"}";
+        if (++idx < paired_keys_.size()) file << ",";
+        file << "\n";
+    }
+    file << "  ]\n}\n";
+    file.close();
 }
 
 void WindowsAudioRelayServer::GenerateNewPairCode() {
@@ -229,7 +306,11 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 uint64_t nonce_val = gen();
                 current_nonce_ = ToHex((const uint8_t*)&nonce_val, 8);
 
-                bool is_paired = (paired_keys_.find(client_device_id_) != paired_keys_.end());
+                bool is_paired = false;
+                {
+                    std::lock_guard<std::mutex> lock(net_mutex_);
+                    is_paired = (paired_keys_.find(client_device_id_) != paired_keys_.end());
+                }
 
                 std::ostringstream oss;
                 oss << "{\"type\":\"HELLO_ACK\","
@@ -251,23 +332,37 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     status_callback_("pairing", client_name);
                 }
             } else if (type == "PAIR_REQUEST") {
-                std::string code = ExtractJsonString(line, "code");
-                if (code == pair_code_) {
-                    std::random_device rd;
-                    std::mt19937_64 gen(rd());
-                    uint64_t sess_val = gen();
-                    session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
-                    std::string sess_hex = ToHex(session_id_.data(), 8);
+                // Protocol v2: proof = HMAC-SHA256(code, phone_device_id || nonce_from_HELLO_ACK)
+                std::string client_proof = ExtractJsonString(line, "proof");
 
-                    std::string salt = client_device_id_ + device_id_;
-                    session_key_.resize(32);
-                    hkdf_sha256_32(
-                        (const uint8_t*)salt.data(), salt.size(),
-                        (const uint8_t*)pair_code_.data(), pair_code_.size(),
-                        (const uint8_t*)"audio-relay-session-v1", 22,
-                        session_key_.data()
-                    );
-                    paired_keys_[client_device_id_] = session_key_;
+                std::string expected_proof = hmac_sha256_hex(
+                    (const uint8_t*)pair_code_.data(), pair_code_.size(),
+                    client_device_id_ + current_nonce_
+                );
+
+                if (!client_proof.empty() && constant_time_eq_str(client_proof, expected_proof)) {
+                    std::string sess_hex;
+                    {
+                        std::lock_guard<std::mutex> lock(net_mutex_);
+                        sequence_ = 0; // Reset sequence per session
+
+                        std::random_device rd;
+                        std::mt19937_64 gen(rd());
+                        uint64_t sess_val = gen();
+                        session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
+                        sess_hex = ToHex(session_id_.data(), 8);
+
+                        std::string salt = client_device_id_ + device_id_;
+                        session_key_.resize(32);
+                        hkdf_sha256_32(
+                            (const uint8_t*)salt.data(), salt.size(),
+                            (const uint8_t*)pair_code_.data(), pair_code_.size(),
+                            (const uint8_t*)"audio-relay-session-v1", 22,
+                            session_key_.data()
+                        );
+                        paired_keys_[client_device_id_] = session_key_;
+                        SaveConfig();
+                    }
 
                     std::ostringstream oss;
                     oss << "{\"type\":\"PAIR_OK\",\"session_id\":\"" << sess_hex << "\"}";
@@ -282,18 +377,38 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"invalid_code\"}");
                 }
             } else if (type == "REPAIR") {
+                // Protocol v2: proof = HMAC-SHA256(persisted_key, device_id || nonce_from_HELLO_ACK)
                 std::string req_device_id = ExtractJsonString(line, "device_id");
                 if (req_device_id.empty()) req_device_id = client_device_id_;
+                std::string client_proof = ExtractJsonString(line, "proof");
 
-                auto it = paired_keys_.find(req_device_id);
-                if (it != paired_keys_.end()) {
-                    session_key_ = it->second;
-                    std::random_device rd;
-                    std::mt19937_64 gen(rd());
-                    uint64_t sess_val = gen();
-                    session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
-                    std::string sess_hex = ToHex(session_id_.data(), 8);
+                bool success = false;
+                std::string sess_hex;
 
+                {
+                    std::lock_guard<std::mutex> lock(net_mutex_);
+                    auto it = paired_keys_.find(req_device_id);
+                    if (it != paired_keys_.end()) {
+                        std::string expected_proof = hmac_sha256_hex(
+                            it->second.data(), it->second.size(),
+                            req_device_id + current_nonce_
+                        );
+
+                        if (!client_proof.empty() && constant_time_eq_str(client_proof, expected_proof)) {
+                            success = true;
+                            sequence_ = 0; // Reset sequence per session
+                            session_key_ = it->second;
+
+                            std::random_device rd;
+                            std::mt19937_64 gen(rd());
+                            uint64_t sess_val = gen();
+                            session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
+                            sess_hex = ToHex(session_id_.data(), 8);
+                        }
+                    }
+                }
+
+                if (success) {
                     std::ostringstream oss;
                     oss << "{\"type\":\"PAIR_OK\",\"session_id\":\"" << sess_hex << "\"}";
                     SendJson(client_sock, oss.str());
@@ -306,8 +421,13 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 } else {
                     SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"key_expired_or_not_found\"}");
                 }
-            } else if (type == "HEARTBEAT") {
-                SendJson(client_sock, "{\"type\":\"HEARTBEAT_ACK\"}");
+            } else if (type == "PING") {
+                int64_t t = ExtractJsonInt64(line, "t", 0);
+                std::ostringstream oss;
+                oss << "{\"type\":\"PONG\",\"t\":" << t << "}";
+                SendJson(client_sock, oss.str());
+            } else if (type == "BYE") {
+                break;
             }
         }
     }
@@ -339,14 +459,18 @@ void WindowsAudioRelayServer::TcpAudioLoop() {
 }
 
 void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
+    std::lock_guard<std::mutex> lock(net_mutex_);
+
     if (session_key_.size() != 32 || session_id_.size() != 8) {
         return;
     }
 
     sequence_++;
 
-    auto now = std::chrono::system_clock::now().time_since_epoch();
-    uint32_t ts_ms = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now).count() & 0xFFFFFFFF);
+    // Monotonic timestamp in milliseconds
+    static const auto start_time = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+    uint32_t ts_ms = (uint32_t)(elapsed & 0xFFFFFFFF);
 
     // Protocol Header (13 bytes):
     // [0] = 0x00
@@ -380,7 +504,7 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     nonce[10] = header[3];
     nonce[11] = header[4];
 
-    // Encrypt with ChaCha20-Poly1305
+    // Encrypt with ChaCha20-Poly1305 (AAD = header 13B)
     std::vector<uint8_t> ciphertext(pcm.size());
     uint8_t tag[16];
     chacha20_poly1305_seal(
@@ -398,8 +522,6 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     datagram.insert(datagram.end(), header, header + 13);
     datagram.insert(datagram.end(), ciphertext.begin(), ciphertext.end());
     datagram.insert(datagram.end(), tag, tag + 16);
-
-    std::lock_guard<std::mutex> lock(net_mutex_);
 
     // 1. Send over UDP (Wi-Fi)
     if (has_active_udp_ && udp_sock_ != INVALID_SOCKET) {
@@ -425,7 +547,6 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
 
 void WindowsAudioRelayServer::AdbSupervisorLoop() {
     while (is_running_.load()) {
-        // Execute adb reverse silently using Win32 CreateProcess
         STARTUPINFOA si{};
         si.cb = sizeof(si);
         si.dwFlags = STARTF_USESHOWWINDOW;

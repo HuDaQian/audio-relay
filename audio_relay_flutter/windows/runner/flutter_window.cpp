@@ -35,22 +35,19 @@ bool FlutterWindow::OnCreate() {
 
   // Setup desktop MethodChannels
   auto messenger = flutter_controller_->engine()->messenger();
-  desktop_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+  desktop_channel_ = std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
       messenger, "com.audiorelay.flutter/desktop",
-      &flutter::StandardMethodCodec::GetInstance());
-  desktop_events_channel_ = std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
-      messenger, "com.audiorelay.flutter/desktop_events",
       &flutter::StandardMethodCodec::GetInstance());
 
   auto& server = audio_relay::WindowsAudioRelayServer::Instance();
-  auto events_chan = desktop_events_channel_;
-  server.SetStatusCallback([events_chan](const std::string& status, const std::string& client_name) {
+  auto chan = desktop_channel_;
+  server.SetStatusCallback([chan](const std::string& status, const std::string& client_name) {
     flutter::EncodableMap args;
     args[flutter::EncodableValue("status")] = flutter::EncodableValue(status);
     if (!client_name.empty()) {
       args[flutter::EncodableValue("clientName")] = flutter::EncodableValue(client_name);
     }
-    events_chan->InvokeMethod("onStatusChanged", std::make_unique<flutter::EncodableValue>(args));
+    chan->InvokeMethod("onStatusChanged", std::make_unique<flutter::EncodableValue>(args));
   });
 
   server.Start();
@@ -100,7 +97,6 @@ bool FlutterWindow::OnCreate() {
 void FlutterWindow::OnDestroy() {
   audio_relay::WindowsAudioRelayServer::Instance().Stop();
   desktop_channel_ = nullptr;
-  desktop_events_channel_ = nullptr;
 
   if (flutter_controller_) {
     flutter_controller_ = nullptr;

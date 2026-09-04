@@ -31,4 +31,11 @@ void chacha20_poly1305_seal(const uint8_t key[32],
                             uint8_t* out_ciphertext,
                             uint8_t out_tag[16]);
 
+// Constant-time memory comparison to prevent timing attacks
+bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t len);
+bool constant_time_eq_str(const std::string& a, const std::string& b);
+
+// Compute HMAC-SHA256 and return lower-case hex string
+std::string hmac_sha256_hex(const uint8_t* key, size_t key_len, const std::string& data);
+
 } // namespace audio_relay
