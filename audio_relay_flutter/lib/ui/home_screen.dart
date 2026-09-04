@@ -69,22 +69,40 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('Desktop channel error: $e');
     }
 
-    if (Platform.isMacOS) {
-      _permissionTimer?.cancel();
-      _permissionTimer = Timer.periodic(const Duration(seconds: 2), (t) async {
-        if (!mounted) {
-          t.cancel();
-          return;
-        }
-        try {
-          final granted = await _desktopChannel.invokeMethod<bool>('checkPermission') ?? true;
-          if (granted != _hasAudioPermission && mounted) {
+    // Poll desktop status, permissions, and pair code (auto-updates when 5-min expires)
+    _permissionTimer?.cancel();
+    _permissionTimer = Timer.periodic(const Duration(seconds: 3), (t) async {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      try {
+        final info = await _desktopChannel.invokeMethod<Map>('getServerInfo');
+        if (info != null && mounted) {
+          final newCode = info['pairCode'] as String? ?? _desktopPairCode;
+          final granted = info['hasPermission'] as bool? ?? _hasAudioPermission;
+          if (newCode != _desktopPairCode || granted != _hasAudioPermission) {
             setState(() {
+              _desktopPairCode = newCode;
               _hasAudioPermission = granted;
             });
           }
-        } catch (_) {}
-      });
+        }
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _regenerateDesktopPairCode() async {
+    try {
+      await _desktopChannel.invokeMethod('regenerateCode');
+      final info = await _desktopChannel.invokeMethod<Map>('getServerInfo');
+      if (info != null && mounted) {
+        setState(() {
+          _desktopPairCode = info['pairCode'] as String? ?? _desktopPairCode;
+        });
+      }
+    } catch (e) {
+      debugPrint('regenerateCode error: $e');
     }
   }
 
@@ -532,7 +550,20 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                   const Divider(height: 32),
-                  const Text('配对验证码 (请在手机端输入)：', style: TextStyle(fontWeight: FontWeight.bold)),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        '配对验证码 (5分钟有效，请在手机端输入)：',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      TextButton.icon(
+                        onPressed: _regenerateDesktopPairCode,
+                        icon: const Icon(Icons.refresh_rounded, size: 16),
+                        label: const Text('刷新配对码', style: TextStyle(fontSize: 12)),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 8),
                   Container(
                     width: double.infinity,

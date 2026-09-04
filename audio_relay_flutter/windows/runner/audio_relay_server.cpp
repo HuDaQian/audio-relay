@@ -166,15 +166,26 @@ void WindowsAudioRelayServer::GenerateNewPairCode() {
     uint32_t code_num = val % 1000000;
     char buf[16];
     snprintf(buf, sizeof(buf), "%06u", code_num);
+
+    std::lock_guard<std::mutex> lock(pair_code_mutex_);
     pair_code_ = buf;
     pair_code_created_at_ = std::chrono::steady_clock::now();
 }
 
 std::string WindowsAudioRelayServer::GetPairCode() {
+    std::lock_guard<std::mutex> lock(pair_code_mutex_);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - pair_code_created_at_).count();
     if (elapsed > 300 || pair_code_.empty()) {
-        GenerateNewPairCode();
+        uint32_t val = 0;
+        do {
+            GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
+        } while (val >= 4294000000ULL);
+        uint32_t code_num = val % 1000000;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%06u", code_num);
+        pair_code_ = buf;
+        pair_code_created_at_ = std::chrono::steady_clock::now();
     }
     return pair_code_;
 }
@@ -356,19 +367,33 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     status_callback_("pairing", client_name);
                 }
             } else if (type == "PAIR_REQUEST") {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - pair_code_created_at_).count();
-                if (elapsed > 300) {
-                    GenerateNewPairCode();
-                    SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"code_expired\"}");
-                    continue;
+                std::string current_pair_code;
+                {
+                    std::lock_guard<std::mutex> lock(pair_code_mutex_);
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - pair_code_created_at_).count();
+                    if (elapsed > 300 || pair_code_.empty()) {
+                        uint32_t val = 0;
+                        do {
+                            GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
+                        } while (val >= 4294000000ULL);
+                        uint32_t code_num = val % 1000000;
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "%06u", code_num);
+                        pair_code_ = buf;
+                        pair_code_created_at_ = std::chrono::steady_clock::now();
+
+                        SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"code_expired\"}");
+                        continue;
+                    }
+                    current_pair_code = pair_code_;
                 }
 
                 // Protocol v2: proof = HMAC-SHA256(code, phone_device_id || nonce_from_HELLO_ACK)
                 std::string client_proof = ExtractJsonString(line, "proof");
 
                 std::string expected_proof = hmac_sha256_hex(
-                    (const uint8_t*)pair_code_.data(), pair_code_.size(),
+                    (const uint8_t*)current_pair_code.data(), current_pair_code.size(),
                     local_client_device_id + local_current_nonce
                 );
 
@@ -386,7 +411,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         session_key_.resize(32);
                         hkdf_sha256_32(
                             (const uint8_t*)salt.data(), salt.size(),
-                            (const uint8_t*)pair_code_.data(), pair_code_.size(),
+                            (const uint8_t*)current_pair_code.data(), current_pair_code.size(),
                             (const uint8_t*)"audio-relay-session-v1", 22,
                             session_key_.data()
                         );

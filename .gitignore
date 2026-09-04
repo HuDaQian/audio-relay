@@ -14,7 +14,9 @@
 
 # --- Runtime state / secrets (never commit paired-device config) ---
 config.toml
+config.json
 **/AudioRelay/config.toml
+**/AudioRelay/config.json
 *.keystore
 *.jks
 !debug.keystore

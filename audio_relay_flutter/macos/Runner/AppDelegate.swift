@@ -216,10 +216,17 @@ class MacAudioRelayServer {
     private(set) var pairCode: String = ""
     private(set) var pairCodeCreatedAt: Date = Date()
     var currentPairCode: String {
-        if Date().timeIntervalSince(pairCodeCreatedAt) > 300 || pairCode.isEmpty {
+        stateLock.lock()
+        let expired = Date().timeIntervalSince(pairCodeCreatedAt) > 300 || pairCode.isEmpty
+        let code = pairCode
+        stateLock.unlock()
+        if expired {
             generateNewPairCode()
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return pairCode
         }
-        return pairCode
+        return code
     }
     private(set) var deviceId: String = UUID().uuidString
     private(set) var deviceName: String = Host.current().localizedName ?? "MacBook"
@@ -312,8 +319,11 @@ class MacAudioRelayServer {
         repeat {
             _ = SecRandomCopyBytes(kSecRandomDefault, 4, &num)
         } while num >= 4294000000
-        pairCode = String(format: "%06d", num % 1000000)
+        let newCode = String(format: "%06d", num % 1000000)
+        stateLock.lock()
+        pairCode = newCode
         pairCodeCreatedAt = Date()
+        stateLock.unlock()
     }
 
     func start() {
@@ -396,7 +406,19 @@ class MacAudioRelayServer {
         }
     }
 
-    var isCapturing = false
+    private var _isCapturing = false
+    var isCapturing: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _isCapturing
+        }
+        set {
+            stateLock.lock()
+            _isCapturing = newValue
+            stateLock.unlock()
+        }
+    }
 
     func triggerStartCapture() {
         guard !isCapturing else { return }
@@ -454,10 +476,14 @@ class MacAudioRelayServer {
             params.allowLocalEndpointReuse = true
             let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: audioTcpPort)!)
             listener.newConnectionHandler = { [weak self] newConn in
-                self?.activeAudioTcpConnection?.cancel()
-                self?.activeAudioTcpConnection = newConn
+                guard let self = self else { return }
+                self.stateLock.lock()
+                let oldConn = self.activeAudioTcpConnection
+                self.activeAudioTcpConnection = newConn
+                self.stateLock.unlock()
+                oldConn?.cancel()
                 newConn.start(queue: .global())
-                os_log("TCP Audio Channel connected on port %d", self?.audioTcpPort ?? 45109)
+                os_log("TCP Audio Channel connected on port %d", self.audioTcpPort)
             }
             listener.start(queue: .main)
             self.tcpAudioListener = listener
@@ -467,9 +493,12 @@ class MacAudioRelayServer {
     }
 
     private func handleNewControlConnection(_ conn: NWConnection) {
-        activeControlConnection?.cancel()
+        stateLock.lock()
+        let oldCtrl = activeControlConnection
         activeControlConnection = conn
         controlBuffer = ""
+        stateLock.unlock()
+        oldCtrl?.cancel()
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled:
@@ -585,21 +614,23 @@ class MacAudioRelayServer {
     }
 
     private func handlePairRequest(_ json: [String: Any], conn: NWConnection) {
-        if Date().timeIntervalSince(pairCodeCreatedAt) > 300 {
+        stateLock.lock()
+        let elapsed = Date().timeIntervalSince(pairCodeCreatedAt)
+        if elapsed > 300 || pairCode.isEmpty {
+            stateLock.unlock()
             generateNewPairCode()
             sendJson(["type": "PAIR_FAIL", "reason": "code_expired"], to: conn)
             return
         }
-
-        let clientProof = json["proof"] as? String ?? ""
-
-        stateLock.lock()
+        let currentCode = pairCode
         let currentClientDevId = clientDeviceId
         let nonce = currentNonce
         stateLock.unlock()
 
+        let clientProof = json["proof"] as? String ?? ""
+
         let expectedMsg = (currentClientDevId + nonce).data(using: .utf8)!
-        let pairCodeKey = SymmetricKey(data: pairCode.data(using: .utf8)!)
+        let pairCodeKey = SymmetricKey(data: currentCode.data(using: .utf8)!)
 
         guard let proofData = dataFromHex(clientProof),
               HMAC<SHA256>.isValidAuthenticationCode(proofData, authenticating: expectedMsg, using: pairCodeKey) else {
@@ -613,7 +644,7 @@ class MacAudioRelayServer {
         let sessIdHex = sessIdBytes.map { String(format: "%02x", $0) }.joined()
 
         let salt = (currentClientDevId + deviceId).data(using: .utf8)!
-        let codeData = pairCode.data(using: .utf8)!
+        let codeData = currentCode.data(using: .utf8)!
         let prk = SymmetricKey(data: HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: codeData),
             salt: salt,

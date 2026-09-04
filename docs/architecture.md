@@ -353,7 +353,7 @@ track, and backs off instead of retrying instantly.
   device on one side (there's a "Forget" action in both apps' Settings)
   doesn't tell the other side. The server's `HELLO_ACK.paired` flag is
   therefore only ever a hint, not a guarantee the phone can actually
-  `REPAIR` — see `protocol-spec.md` §4/§5 and `android-app`'s handling in
+  `REPAIR` — see `protocol-spec.md` §4/§5 and the Android app's handling in
   `RelayService.connectTo`, which falls back to a fresh pairing code
   whenever it doesn't actually have a usable local key, regardless of what
   the laptop claims. Symmetrically, the laptop always keeps a pairing code

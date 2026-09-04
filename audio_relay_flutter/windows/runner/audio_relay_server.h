@@ -51,6 +51,7 @@ private:
     void LoadConfig();
     void SaveConfig();
 
+    mutable std::mutex pair_code_mutex_;
     std::string pair_code_;
     std::chrono::steady_clock::time_point pair_code_created_at_;
     std::string device_name_;
