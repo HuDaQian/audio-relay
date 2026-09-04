@@ -1,4 +1,4 @@
-name: Build All Platforms (Audio Relay Flutter)
+name: Build Platforms (Audio Relay Flutter)
 
 on:
   workflow_dispatch:
@@ -49,35 +49,3 @@ jobs:
           name: audio-relay-windows
           path: audio_relay_flutter/audio-relay-windows.zip
 
-  build-macos-ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true
-      - name: Build macOS
-        working-directory: audio_relay_flutter
-        run: |
-          flutter build macos --release
-          cd build/macos/Build/Products/Release
-          zip -r -q ../../../../../audio-relay-macos.zip audio_relay_flutter.app
-          cd ../../../../../
-      - name: Build iOS
-        working-directory: audio_relay_flutter
-        run: |
-          flutter build ios --release --no-codesign
-          mkdir -p build/ios/Payload
-          cp -r build/ios/iphoneos/Runner.app build/ios/Payload/
-          cd build/ios
-          zip -r -q ../../audio-relay-ios.ipa Payload
-          cd ../../
-      - uses: actions/upload-artifact@v4
-        with:
-          name: audio-relay-macos
-          path: audio_relay_flutter/audio-relay-macos.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: audio-relay-ios
-          path: audio_relay_flutter/audio-relay-ios.ipa
