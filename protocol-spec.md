@@ -9,8 +9,8 @@ and independently recompute the session key. `PAIR_REQUEST` now carries a
 challenge-response proof instead, the same way `REPAIR` already avoided
 sending the session key — see §4.2 and §5.
 
-This is the canonical definition of the wire protocol between `desktop-app`
-and `android-app`. Both implementations must match this document exactly.
+This is the canonical definition of the wire protocol between the desktop sender
+(macOS / Windows) and the Android receiver app. Both implementations must match this document exactly.
 If you change the protocol, update this file first, bump the version below,
 and update both apps in the same PR — see `AGENTS.md`.
 
@@ -32,15 +32,15 @@ mDNS/DNS-SD, described in §5.
 
 ## 2. Discovery (mDNS)
 
-The Windows app advertises a service:
+The desktop app (macOS / Windows) advertises a service:
 
 - **Service type:** `_audiorelay._udp.local.`
 - **Port:** the TCP control port (audio's UDP port is sent separately in
   `HELLO`, see §4.1 — mDNS only needs to get the phone to the control port).
 - **TXT record keys:**
-  - `id` — a stable device ID (UUIDv4, generated once and persisted in
-    `config.toml`, see `desktop-app/README.md`).
-  - `name` — human-readable hostname, e.g. `DESKTOP-A1B2C3`.
+  - `id` — a stable device ID (UUIDv4 on macOS, unique ID on Windows, generated once
+    and persisted in `config.json`).
+  - `name` — human-readable hostname, e.g. `DESKTOP-A1B2C3` or `MacBook-Pro`.
   - `protocol_version` — this document's version, as an integer (`2`).
 
 The Android app browses for `_audiorelay._udp` via `NsdManager`. Multiple
@@ -174,11 +174,12 @@ changelog note at the top of this file.)
 3. **First pairing:** phone computes
    `proof = HMAC-SHA256(key = code, msg = phone_device_id || nonce)`,
    hex-encoded, and sends `PAIR_REQUEST{proof}`. Laptop computes the same
-   HMAC using the code it's currently displaying (rejecting if none is
-   currently valid — codes are valid for 5 minutes, then regenerated) and
-   compares it to the received proof **in constant time**. A match proves
-   the phone's user typed the same code the laptop is showing, without the
-   code ever appearing on the wire.
+   HMAC using the code it's currently displaying (rejecting with
+   `PAIR_FAIL{"reason":"code_expired"}` if expired — codes are valid for 5
+   minutes / 300 seconds, then regenerated) and compares it to the received
+   proof **in constant time**. A match proves the phone's user typed the
+   same code the laptop is showing, without the code ever appearing on the
+   wire.
 4. **Reconnect:** phone computes
    `proof = HMAC-SHA256(key = persisted_session_key, msg = phone_device_id || nonce)`
    and sends `REPAIR{device_id, proof}`; laptop looks up the persisted key
@@ -192,9 +193,10 @@ changelog note at the top of this file.)
    laptop. On a successful `REPAIR`, both sides already hold the persisted
    key from the original pairing — nothing new is derived.
 6. Laptop persists `{device_id: phone_id, session_key, device_name}` to
-   `config.toml` (see `desktop-app/README.md`) so future connections can use
-   `REPAIR` instead of asking for the code again. Phone persists the same
-   tuple (keyed by laptop's `device_id`) in its local storage.
+   `config.json` (`%LOCALAPPDATA%\AudioRelay\config.json` on Windows,
+   `~/Library/Application Support/AudioRelay/config.json` on macOS) so future
+   connections can use `REPAIR` instead of asking for the code again. Phone
+   persists the same tuple (keyed by laptop's `device_id`) in its local storage.
 7. On every connection (first pair or reconnect), the laptop mints a fresh
    random `session_id` (used in the UDP nonce, §3.1) and sends it in
    `PAIR_OK`.

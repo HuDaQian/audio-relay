@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <map>
@@ -29,7 +30,7 @@ public:
     void GenerateNewPairCode();
     void TriggerStartCapture();
 
-    std::string GetPairCode() const { return pair_code_; }
+    std::string GetPairCode();
     int GetPort() const { return 45108; }
     std::string GetDeviceName() const { return device_name_; }
     bool IsCapturing() const { return capture_.IsRunning(); }
@@ -51,6 +52,7 @@ private:
     void SaveConfig();
 
     std::string pair_code_;
+    std::chrono::steady_clock::time_point pair_code_created_at_;
     std::string device_name_;
     std::string device_id_;
 

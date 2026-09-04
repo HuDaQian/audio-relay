@@ -290,6 +290,32 @@ class _HomeScreenState extends State<HomeScreen> {
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            if (Platform.isIOS) ...[
+              Card(
+                color: Colors.amber.shade50,
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: BorderSide(color: Colors.amber.shade300),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Icon(Icons.info_outline_rounded, color: Colors.amber.shade800),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'iOS 暂不支持音频接收功能。目前移动端仅支持 Android 设备的低延迟 AudioTrack 播放。',
+                          style: TextStyle(color: Colors.amber.shade900, fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
             // USB Tethering Banner (Option 1)
             Card(
               color: hasUsbTether

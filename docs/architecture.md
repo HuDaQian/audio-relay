@@ -26,34 +26,39 @@ can remove. This project's job is to not add much *on top* of that.
 ## 1. System architecture overview
 
 ```
-┌──────────────────────────┐        ┌────────────────────────────┐
-│   Windows/Linux Laptop   │        │   Android Phone            │
-│                          │        │                            │
-│  Loopback capture (WASAPI│  UDP   │  UDP audio receiver        │
-│   or PulseAudio)         │ (PCM)  │         │                  │
-│         ▼                │───────▶│         ▼                  │
-│  Framer + sequencer      │  LAN/  │  Jitter buffer             │
-│         │                │hotspot │         │                  │
-│         ▼                │        │         ▼                  │
-│  UDP socket (audio)      │        │  AudioTrack (low-latency,  │
-│                          │        │  USAGE_MEDIA) → routed by  │
-│  TCP socket (control:    │  TCP   │  Android to whatever BT    │
-│  discovery ack, pairing, │◀──────▶│  device is already active  │
-│  heartbeat, reconnect)   │        │                            │
-│                          │        │  Foreground Service +      │
-│  mDNS advertise/browse   │  mDNS  │  NSD (mDNS) advertise/     │
-│  ("_audiorelay._udp")    │◀──────▶│  browse                    │
-└──────────────────────────┘        └────────────────────────────┘
+┌─────────────────────────────────┐        ┌────────────────────────────┐
+│   macOS / Windows Desktop       │        │   Android Phone            │
+│   (Unified Flutter App)         │        │   (Unified Flutter App)    │
+│                                 │        │                            │
+│  Loopback capture:              │  UDP   │  UDP audio receiver        │
+│  - macOS: ScreenCaptureKit      │ (PCM)  │  (Kotlin AudioReceiver)    │
+│  - Windows: WASAPI C++          │───────▶│         │                  │
+│         ▼                       │  LAN/  │  Jitter buffer             │
+│  Framer + sequencer             │hotspot/│         │                  │
+│         │                       │  USB   │         ▼                  │
+│         ▼                       │        │  AudioTrack (low-latency,  │
+│  UDP / TCP socket (audio)       │        │  USAGE_MEDIA) → routed by  │
+│                                 │        │  Android to whatever BT    │
+│  TCP socket (control:           │  TCP   │  device is already active  │
+│  discovery ack, pairing,        │◀──────▶│                            │
+│  heartbeat, reconnect)          │        │  Foreground Service +      │
+│                                 │        │  NSD (mDNS) browse         │
+│  mDNS advertise / DNS-SD        │  mDNS  │  ("_audiorelay._udp")      │
+│  ("_audiorelay._udp")           │◀──────▶│                            │
+└─────────────────────────────────┘        └────────────────────────────┘
 ```
 
-Two independent apps, both required: a Windows app (pure user-mode,
-portable, minimal status window) and an Android app (native, foreground
-service, holds the socket even with the screen off).
+The application is built on a unified **Flutter** codebase (`audio_relay_flutter/`)
+with native platform runners for capture and playback:
+- **macOS Desktop**: Native `ScreenCaptureKit` loopback capture (macOS 13+) in Swift (`macos/Runner/`).
+- **Windows Desktop**: Native `WASAPI` loopback capture in C++ (`windows/runner/`).
+- **Android App**: Kotlin foreground audio service (`android/`) with low-latency `AudioTrack` (`PERFORMANCE_MODE_LOW_LATENCY`), dynamic jitter buffer, and Bluetooth playback.
+- **USB / Cable**: Automated `adb reverse` tunneling on `tcp:45108` and `tcp:45109`.
 
-### 1.1 Why native Android, not a browser
+### 1.1 Why native Android playback, not a browser
 
 Browser-based (Web Audio/WebRTC in Chrome for Android) was seriously
-considered and rejected for v1:
+considered and rejected:
 
 - Android Chrome suspends/throttles background tabs and applies aggressive
   audio-focus/Doze restrictions once the screen is off — exactly the
@@ -61,98 +66,54 @@ considered and rejected for v1:
 - No way to run a foreground service with a wake lock from a tab, so
   reconnection-after-sleep is much less reliable.
 - WebRTC would still need a signaling path and a media-engine bridge on the
-  Windows side to inject non-microphone PCM into an `RTCPeerConnection` —
-  real work, for a receiver that's *less* reliable than a native app.
-- A native app gets `AudioTrack` in `PERFORMANCE_MODE_LOW_LATENCY`, direct
+  desktop side to inject non-microphone PCM into an `RTCPeerConnection`.
+- A native Kotlin service gets `AudioTrack` in `PERFORMANCE_MODE_LOW_LATENCY`, direct
   control over buffer sizes, and a `MediaSession` so it behaves like a
   normal media player to Android (survives Doze the same way Spotify does).
-
-A browser-based receiver stays a documented future option (roadmap Phase 7)
-if a zero-install phone side ever becomes a priority, but it's the wrong
-trade-off for reliability + latency today.
 
 ## 2. Desktop component
 
 ### 2.1 Audio capture
 
+**macOS:**
+- **API:** `ScreenCaptureKit` (`SCStream`) loopback capture in Swift (macOS 13+).
+- Event-driven audio buffer callback capturing system audio mix without virtual audio drivers.
+- Automatically handles interleaved / non-interleaved float32 or int16 PCM conversion to 48kHz 16-bit stereo.
+
 **Windows:**
 - **API:** WASAPI loopback capture in shared mode, event-driven (not
-  polling) for lowest latency.
+  polling) for lowest latency (`windows/runner/wasapi_capture.cpp`).
 - No driver, no admin — this is a standard `IAudioClient` activated on the
   default render endpoint with `AUDCLNT_STREAMFLAGS_LOOPBACK`. Documented,
   stable, used by every legitimate "record what you hear" tool on Windows.
-- Capture the mix format the endpoint is already using (48kHz, stereo is
-  typical) rather than forcing a resample at the driver level; the receiver
-  honors whatever `sample_rate_id`/`channels` is in each packet (see
-  `protocol-spec.md` §3), so there's no need to force a fixed rate.
-- **Future-only, not v1:** process-specific loopback (`ACTIVATE_AUDIO_INTERFACE_PARAMS`
-  process-loopback mode, Win10 2004+) for "capture just Spotify" —
-  architected for (codec/format fields are per-packet, not global), not
-  built, in v1.
+- Automatically handles float32/int16 and 44.1kHz/48kHz sample formats.
 
-**Linux:**
-- **API:** the PulseAudio Simple API (`libpulse-simple-binding`), recording
-  from the selected sink's `.monitor` source — the same "record what you
-  hear" trick as WASAPI loopback, just PulseAudio's version of it. No
-  driver, no root, no PipeWire-specific code needed: PipeWire's
-  `pipewire-pulse` compatibility layer serves the same PulseAudio protocol,
-  so this one backend covers classic PulseAudio and modern PipeWire distros
-  alike (Ubuntu 22.04+, Fedora, etc.).
-- Device enumeration and default-sink resolution go through
-  `libpulse-binding`'s async introspection API (`Context` + a blocking
-  `Mainloop::iterate` poll) since the Simple API has no introspection of
-  its own; the actual audio read is the Simple API's blocking `read()`.
-- Unlike WASAPI, requests a fixed 48kHz stereo S16LE stream rather than
-  whatever rate the sink happens to be running at — PulseAudio resamples
-  internally to match, so this backend never needs WASAPI's "map whatever
-  rate the endpoint hands back onto the protocol's two supported rates"
-  logic (see `protocol-spec.md` §3).
-- Rejected for this: hand-rolled PipeWire bindings (a much larger binding
-  surface for the value) and the `cpal` crate (a new heavyweight dependency
-  per `AGENTS.md`'s "discuss first" rule, and not naturally suited to
-  loopback-monitor recording).
+### 2.2 Language/runtime choice: Flutter + Native Platform Runners
 
-### 2.2 Language/runtime choice: Rust
-
-| Option | Verdict |
-|---|---|
-| **Rust** (`wasapi` + `windows` crates on Windows, `libpulse-binding`/`libpulse-simple-binding` on Linux, `tokio`, `egui`/`eframe` for UI) | **Chosen.** Single static binary per platform, zero runtime dependency, smallest attack surface, lowest overhead. The `wasapi` crate wraps loopback capture cleanly on Windows; the two `libpulse-*-binding` crates are safe wrappers over `libpulse-sys`/`libpulse-simple-sys`, not hand-rolled FFI, on Linux — neither platform needs raw COM/C calls. |
-| C# + NAudio | Faster to prototype, but a self-contained single-file publish is 60–100MB and still needs the .NET runtime bundled — heavier for a "download and run" utility. |
-| C++ raw WASAPI | Maximum control, smallest binary, but slowest to build correctly (COM lifetime bugs, no memory safety). |
-
-**Electron/Tauri are deliberately avoided for the UI.** WebView2 is usually
-present on Win11 but not guaranteed everywhere, and it reintroduces an
-install-adjacent dependency. `egui`/`eframe` is pure Rust, compiles into the
-same static binary, no WebView — keeps the "just an exe" promise airtight.
+| Component | Technology | Rationale |
+|---|---|---|
+| **UI & App Shell** | Flutter (Dart) | Modern Material 3 UI across Android, macOS, and Windows with a single shared codebase, hot reload, and responsive layouts. |
+| **macOS Runner** | Swift (`ScreenCaptureKit`, `Network.framework`) | High performance system audio loopback without kernel extensions, native `NWListener` for TCP/UDP with mDNS. |
+| **Windows Runner** | C++ (WASAPI, WinSock2, BCrypt) | User-mode COM loopback capture, zero extra runtime dependencies, cryptographically secure RNG via BCrypt, custom raw DNS-SD responder. |
+| **Android Service** | Kotlin (`AudioTrack`, `DatagramSocket`) | Foreground service with wake lock, low-latency AudioTrack, dynamic jitter buffer, surviving screen-off and Doze mode. |
 
 ### 2.3 Desktop-side responsibilities
 
 1. Loopback-capture the default output endpoint continuously.
 2. Chunk into small frames (5–10ms, e.g. 480 samples @ 48kHz) and stamp each
    with a monotonically increasing sequence number + timestamp.
-3. Advertise itself on the LAN via mDNS (`_audiorelay._udp.local`, TXT
-   record with hostname + a short device ID).
+3. Advertise itself on the LAN via mDNS / DNS-SD (`_audiorelay._udp.local`, TXT
+   record with hostname + device ID + protocol version).
 4. Run a TCP control channel per connected phone: pairing handshake,
-   capability exchange, heartbeat, clean disconnect/reconnect signaling.
+   capability exchange, heartbeat (PING/PONG), clean disconnect/reconnect signaling.
 5. Stream raw PCM frames over UDP to the paired phone's audio port once
-   paired.
+   paired (or TCP loopback over USB cable via `adb reverse`).
 6. Persist last-paired device (ID + derived session key + last-known name)
-   under `%LOCALAPPDATA%\AudioRelay\config.toml` on Windows, or
-   `$XDG_CONFIG_HOME/audiorelay/config.toml` on Linux, so re-pairing isn't
+   under `%LOCALAPPDATA%\AudioRelay\config.json` on Windows, or
+   `~/Library/Application Support/AudioRelay/config.json` on macOS, so re-pairing isn't
    needed every launch.
-7. Minimal UI: connection status, paired device name, pairing code
-   whenever nothing is actively streaming (not just before the first
-   pairing — a disconnected session shows one too, since a phone can need a
-   fresh code at any point, e.g. it forgot this laptop or it's a different
-   phone), Start/Stop, latency-mode toggle (Low/Balanced).
-8. **Local playback control:** "Also play locally while relaying" — on by
-   default, matching loopback capture's natural behavior (it doesn't touch
-   local playback at all). Turning it off mutes this laptop's own output
-   for the duration of an active stream: `SetSinkMute`-equivalent via
-   PulseAudio's introspection API on Linux, `IAudioEndpointVolume::SetMute`
-   on Windows. Applied idempotently once per capture chunk against the
-   desired state, so it's cheap to check and only actually calls into the
-   OS on an actual change — see `capture::mod`'s `should_mute_local_playback`.
+7. Minimal UI: connection status, paired device name, 6-digit pairing code
+   with 5-minute cryptographic expiration, Start/Stop, and audio permissions check.
 
 ## 3. Android component
 
@@ -376,8 +337,9 @@ track, and backs off instead of retrying instantly.
 
 ## 5. Discovery & pairing
 
-- **Discovery:** mDNS/DNS-SD both directions — Windows advertises via the
-  `mdns-sd` Rust crate, Android browses via `NsdManager`. Works identically
+- **Discovery:** mDNS/DNS-SD — Windows advertises via a custom DNS-SD responder
+  on `224.0.0.251:5353`, macOS advertises via `NWListener.Service` (`_audiorelay._udp`),
+  and Android browses via `NsdManager`. Works identically
   on a home router or the phone's own hotspot, since mDNS only needs
   multicast on the local subnet.
 - **Pairing:** Windows generates a random 6-digit code and displays it; the

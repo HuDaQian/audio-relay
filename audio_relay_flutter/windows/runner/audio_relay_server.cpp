@@ -3,13 +3,19 @@
 #include <chrono>
 #include <sstream>
 #include <fstream>
-#include <random>
 #include <iomanip>
 #include <iostream>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace audio_relay {
 
 namespace {
+
+static void GetSecureRandomBytes(uint8_t* buf, size_t len) {
+    BCryptGenRandom(nullptr, (PUCHAR)buf, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+}
 
 // Simple JSON extraction helpers
 std::string ExtractJsonString(const std::string& json, const std::string& key) {
@@ -99,11 +105,9 @@ WindowsAudioRelayServer::WindowsAudioRelayServer() {
     LoadConfig();
 
     if (device_id_.empty()) {
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        uint64_t r1 = gen();
-        uint64_t r2 = gen();
-        device_id_ = "win-" + ToHex((const uint8_t*)&r1, 8) + ToHex((const uint8_t*)&r2, 8);
+        uint8_t r[16];
+        GetSecureRandomBytes(r, sizeof(r));
+        device_id_ = "win-" + ToHex(r, sizeof(r));
         SaveConfig();
     }
 }
@@ -155,12 +159,24 @@ void WindowsAudioRelayServer::SaveConfig() {
 }
 
 void WindowsAudioRelayServer::GenerateNewPairCode() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 999999);
+    uint32_t val = 0;
+    do {
+        GetSecureRandomBytes((uint8_t*)&val, sizeof(val));
+    } while (val >= 4294000000ULL);
+    uint32_t code_num = val % 1000000;
     char buf[16];
-    snprintf(buf, sizeof(buf), "%06d", dis(gen));
+    snprintf(buf, sizeof(buf), "%06u", code_num);
     pair_code_ = buf;
+    pair_code_created_at_ = std::chrono::steady_clock::now();
+}
+
+std::string WindowsAudioRelayServer::GetPairCode() {
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - pair_code_created_at_).count();
+    if (elapsed > 300 || pair_code_.empty()) {
+        GenerateNewPairCode();
+    }
+    return pair_code_;
 }
 
 void WindowsAudioRelayServer::InitNetwork() {
@@ -310,10 +326,9 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 int client_audio_port = ExtractJsonInt(line, "audio_port", 45108);
                 local_client_device_id = ExtractJsonString(line, "device_id");
 
-                std::random_device rd;
-                std::mt19937_64 gen(rd());
-                uint64_t nonce_val = gen();
-                local_current_nonce = ToHex((const uint8_t*)&nonce_val, 8);
+                uint8_t nonce_bytes[8];
+                GetSecureRandomBytes(nonce_bytes, sizeof(nonce_bytes));
+                local_current_nonce = ToHex(nonce_bytes, sizeof(nonce_bytes));
 
                 bool is_paired = false;
                 {
@@ -341,6 +356,14 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                     status_callback_("pairing", client_name);
                 }
             } else if (type == "PAIR_REQUEST") {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - pair_code_created_at_).count();
+                if (elapsed > 300) {
+                    GenerateNewPairCode();
+                    SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"code_expired\"}");
+                    continue;
+                }
+
                 // Protocol v2: proof = HMAC-SHA256(code, phone_device_id || nonce_from_HELLO_ACK)
                 std::string client_proof = ExtractJsonString(line, "proof");
 
@@ -355,10 +378,8 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         std::lock_guard<std::mutex> lock(net_mutex_);
                         sequence_ = 0; // Reset sequence per session
 
-                        std::random_device rd;
-                        std::mt19937_64 gen(rd());
-                        uint64_t sess_val = gen();
-                        session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
+                        session_id_.resize(8);
+                        GetSecureRandomBytes(session_id_.data(), 8);
                         sess_hex = ToHex(session_id_.data(), 8);
 
                         std::string salt = local_client_device_id + device_id_;
@@ -408,10 +429,8 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                             sequence_ = 0; // Reset sequence per session
                             session_key_ = it->second;
 
-                            std::random_device rd;
-                            std::mt19937_64 gen(rd());
-                            uint64_t sess_val = gen();
-                            session_id_.assign((const uint8_t*)&sess_val, (const uint8_t*)&sess_val + 8);
+                            session_id_.resize(8);
+                            GetSecureRandomBytes(session_id_.data(), 8);
                             sess_hex = ToHex(session_id_.data(), 8);
                         }
                     }

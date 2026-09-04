@@ -333,10 +333,9 @@ class RelayService : Service() {
         val target = lastTarget ?: return
         reconnectJob?.cancel()
         reconnectJob = serviceScope.launch {
-            val delayMs = 2000L
-            reconnectAttempt++
+            val delayMs = ReconnectBackoff.delayMsFor(reconnectAttempt++)
             RelayState.setStatus(ConnectionStatus.RECONNECTING)
-            Log.i(TAG, "reconnecting to ${target.name} in ${delayMs}ms")
+            Log.i(TAG, "reconnecting to ${target.name} in ${delayMs}ms (attempt $reconnectAttempt)")
             delay(delayMs)
             connectTo(target)
         }

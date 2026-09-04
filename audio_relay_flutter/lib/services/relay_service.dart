@@ -20,7 +20,7 @@ class RelayPlatformService {
   StreamSubscription? _eventSubscription;
 
   void init() {
-    if (Platform.isAndroid || Platform.isIOS) {
+    if (Platform.isAndroid) {
       _startService();
       _listenEvents();
       checkWiredNetwork();
@@ -87,6 +87,7 @@ class RelayPlatformService {
   }
 
   Future<void> connect(String host, int port) async {
+    if (!Platform.isAndroid) return;
     try {
       await _methodChannel.invokeMethod('connect', {
         'host': host,
@@ -98,6 +99,7 @@ class RelayPlatformService {
   }
 
   Future<void> disconnect() async {
+    if (!Platform.isAndroid) return;
     try {
       await _methodChannel.invokeMethod('disconnect');
     } catch (e) {
@@ -106,6 +108,7 @@ class RelayPlatformService {
   }
 
   Future<void> submitPairingCode(String code) async {
+    if (!Platform.isAndroid) return;
     try {
       await _methodChannel.invokeMethod('submitPairingCode', {
         'code': code,

@@ -24,7 +24,7 @@ class AppDelegate: FlutterAppDelegate {
         switch call.method {
         case "getServerInfo":
           result([
-            "pairCode": server.pairCode,
+            "pairCode": server.currentPairCode,
             "port": Int(server.port),
             "deviceName": server.deviceName,
             "hasPermission": server.isCapturing
@@ -214,6 +214,13 @@ class MacAudioRelayServer {
     let audioTcpPort: UInt16 = 45109
 
     private(set) var pairCode: String = ""
+    private(set) var pairCodeCreatedAt: Date = Date()
+    var currentPairCode: String {
+        if Date().timeIntervalSince(pairCodeCreatedAt) > 300 || pairCode.isEmpty {
+            generateNewPairCode()
+        }
+        return pairCode
+    }
     private(set) var deviceId: String = UUID().uuidString
     private(set) var deviceName: String = Host.current().localizedName ?? "MacBook"
     
@@ -301,7 +308,12 @@ class MacAudioRelayServer {
     }
 
     func generateNewPairCode() {
-        pairCode = String(format: "%06d", arc4random_uniform(1000000))
+        var num: UInt32 = 0
+        repeat {
+            _ = SecRandomCopyBytes(kSecRandomDefault, 4, &num)
+        } while num >= 4294000000
+        pairCode = String(format: "%06d", num % 1000000)
+        pairCodeCreatedAt = Date()
     }
 
     func start() {
@@ -573,6 +585,12 @@ class MacAudioRelayServer {
     }
 
     private func handlePairRequest(_ json: [String: Any], conn: NWConnection) {
+        if Date().timeIntervalSince(pairCodeCreatedAt) > 300 {
+            generateNewPairCode()
+            sendJson(["type": "PAIR_FAIL", "reason": "code_expired"], to: conn)
+            return
+        }
+
         let clientProof = json["proof"] as? String ?? ""
 
         stateLock.lock()
