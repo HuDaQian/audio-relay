@@ -27,4 +27,5 @@ config.json
 *.swp
 .DS_Store
 Thumbs.db
+logs_*.zip
 
