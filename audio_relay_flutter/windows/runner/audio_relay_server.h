@@ -44,6 +44,7 @@ private:
     void HandleControlClient(SOCKET client_sock, sockaddr_in client_addr);
     void TcpAudioLoop();
     void AdbSupervisorLoop();
+    std::string FindAdbPath();
     void MdnsLoop();
 
     void SendJson(SOCKET sock, const std::string& json_str);

@@ -16,6 +16,7 @@ class RelayPlatformService {
       ValueNotifier([]);
   final ValueNotifier<double> audioLevelNotifier = ValueNotifier(0.0);
   final ValueNotifier<bool> hasUsbTetherNotifier = ValueNotifier(false);
+  final ValueNotifier<String> suggestedUsbHostNotifier = ValueNotifier('192.168.42.1');
 
   StreamSubscription? _eventSubscription;
 
@@ -33,6 +34,7 @@ class RelayPlatformService {
     discoveredNotifier.dispose();
     audioLevelNotifier.dispose();
     hasUsbTetherNotifier.dispose();
+    suggestedUsbHostNotifier.dispose();
   }
 
   Future<void> _startService() async {
@@ -79,7 +81,11 @@ class RelayPlatformService {
       final res = await _methodChannel.invokeMethod<Map>('checkWiredNetwork');
       if (res != null) {
         final hasTether = res['hasUsbTether'] as bool? ?? false;
+        final suggestedHost = res['suggestedHost'] as String?;
         hasUsbTetherNotifier.value = hasTether;
+        if (suggestedHost != null && suggestedHost.isNotEmpty && suggestedHost != '127.0.0.1') {
+          suggestedUsbHostNotifier.value = suggestedHost;
+        }
       }
     } catch (e) {
       debugPrint('checkWiredNetwork error: $e');

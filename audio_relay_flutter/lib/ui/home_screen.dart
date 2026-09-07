@@ -391,13 +391,18 @@ class _HomeScreenState extends State<HomeScreen> {
                       spacing: 8,
                       children: [
                         if (hasUsbTether)
-                          FilledButton.icon(
-                            onPressed: () => _service.connect('192.168.42.1', 45108),
-                            icon: const Icon(Icons.flash_on_rounded, size: 18),
-                            label: const Text('USB 极速连接 (192.168.42.1)'),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.green.shade700,
-                            ),
+                          ValueListenableBuilder<String>(
+                            valueListenable: _service.suggestedUsbHostNotifier,
+                            builder: (context, host, _) {
+                              return FilledButton.icon(
+                                onPressed: () => _service.connect(host, 45108),
+                                icon: const Icon(Icons.flash_on_rounded, size: 18),
+                                label: Text('USB 极速连接 ($host)'),
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: Colors.green.shade700,
+                                ),
+                              );
+                            },
                           ),
                         OutlinedButton.icon(
                           onPressed: () => _service.connect('127.0.0.1', 45108),

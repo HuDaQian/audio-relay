@@ -605,7 +605,56 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     }
 }
 
+std::string WindowsAudioRelayServer::FindAdbPath() {
+    // 1. Check same directory as the executable (bundled adb)
+    char exePath[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0) {
+        std::string dir = exePath;
+        size_t lastSlash = dir.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            std::string bundled = dir.substr(0, lastSlash + 1) + "adb.exe";
+            DWORD attr = GetFileAttributesA(bundled.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                return bundled;
+            }
+            std::string bundledSub = dir.substr(0, lastSlash + 1) + "platform-tools\\adb.exe";
+            attr = GetFileAttributesA(bundledSub.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                return bundledSub;
+            }
+        }
+    }
+
+    // 2. Check Android SDK in %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe
+    char localAppData[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+        std::string sdkPath = std::string(localAppData) + "\\Android\\Sdk\\platform-tools\\adb.exe";
+        DWORD attr = GetFileAttributesA(sdkPath.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            return sdkPath;
+        }
+    }
+
+    // 3. Check Program Files / common standalone paths
+    const char* candidates[] = {
+        "C:\\platform-tools\\adb.exe",
+        "C:\\adb\\adb.exe",
+        "C:\\Program Files\\Android\\platform-tools\\adb.exe"
+    };
+    for (const char* path : candidates) {
+        DWORD attr = GetFileAttributesA(path);
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            return path;
+        }
+    }
+
+    // 4. Fallback to system PATH "adb"
+    return "adb";
+}
+
 void WindowsAudioRelayServer::AdbSupervisorLoop() {
+    std::string adb_exe = FindAdbPath();
+
     while (is_running_.load()) {
         STARTUPINFOA si{};
         si.cb = sizeof(si);
@@ -613,15 +662,21 @@ void WindowsAudioRelayServer::AdbSupervisorLoop() {
         si.wShowWindow = SW_HIDE;
         PROCESS_INFORMATION pi{};
 
-        char cmd1[] = "adb reverse tcp:45108 tcp:45108";
-        if (CreateProcessA(nullptr, cmd1, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        std::string cmd1_str = "\"" + adb_exe + "\" reverse tcp:45108 tcp:45108";
+        std::vector<char> cmd1(cmd1_str.begin(), cmd1_str.end());
+        cmd1.push_back('\0');
+
+        if (CreateProcessA(nullptr, cmd1.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             WaitForSingleObject(pi.hProcess, 1000);
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         }
 
-        char cmd2[] = "adb reverse tcp:45109 tcp:45109";
-        if (CreateProcessA(nullptr, cmd2, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        std::string cmd2_str = "\"" + adb_exe + "\" reverse tcp:45109 tcp:45109";
+        std::vector<char> cmd2(cmd2_str.begin(), cmd2_str.end());
+        cmd2.push_back('\0');
+
+        if (CreateProcessA(nullptr, cmd2.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             WaitForSingleObject(pi.hProcess, 1000);
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);

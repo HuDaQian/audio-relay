@@ -92,6 +92,7 @@ class RelayBridge(private val context: Context, messenger: BinaryMessenger) : Me
     private fun checkWiredOptions(): Map<String, Any> {
         var hasUsbTether = false
         var usbTetherIp: String? = null
+        var suggestedHost = "127.0.0.1"
 
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -100,9 +101,15 @@ class RelayBridge(private val context: Context, messenger: BinaryMessenger) : Me
                 val name = iface.name.lowercase()
                 if (name.contains("rndis") || name.contains("usb")) {
                     for (addr in iface.inetAddresses) {
-                        if (!addr.isLoopbackAddress && addr.hostAddress?.contains(":") == false) {
+                        val hostAddr = addr.hostAddress
+                        if (!addr.isLoopbackAddress && hostAddr != null && !hostAddr.contains(":")) {
                             hasUsbTether = true
-                            usbTetherIp = addr.hostAddress
+                            usbTetherIp = hostAddr
+                            // Derive gateway IP (e.g. if phone is 192.168.42.129, gateway/PC is typically 192.168.42.1)
+                            val parts = hostAddr.split(".")
+                            if (parts.size == 4) {
+                                suggestedHost = "${parts[0]}.${parts[1]}.${parts[2]}.1"
+                            }
                             break
                         }
                     }
@@ -115,7 +122,7 @@ class RelayBridge(private val context: Context, messenger: BinaryMessenger) : Me
         return mapOf(
             "hasUsbTether" to hasUsbTether,
             "usbTetherIp" to (usbTetherIp ?: ""),
-            "suggestedHost" to if (hasUsbTether) "192.168.42.1" else "127.0.0.1"
+            "suggestedHost" to suggestedHost
         )
     }
 
