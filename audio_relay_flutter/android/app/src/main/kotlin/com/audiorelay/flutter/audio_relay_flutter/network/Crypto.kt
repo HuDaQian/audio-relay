@@ -91,16 +91,45 @@ object Crypto {
         }
     }
 
+    /**
+     * Encrypts one audio packet's PCM payload using ChaCha20-Poly1305.
+     * [headerAad] is the 13-byte header authenticated as associated data.
+     * Returns ciphertext with the 16-byte Poly1305 tag appended.
+     * When [isMic] is true (phone -> laptop), sets the direction bit (bit 31) in the nonce.
+     */
+    fun encryptPayload(
+        key: ByteArray,
+        sessionId: ByteArray,
+        sequence: UInt,
+        headerAad: ByteArray,
+        plaintext: ByteArray,
+        plaintextOffset: Int = 0,
+        plaintextLength: Int = plaintext.size - plaintextOffset,
+        isMic: Boolean = true,
+    ): ByteArray {
+        try {
+            val cipher = Cipher.getInstance("ChaCha20-Poly1305")
+            val keySpec = SecretKeySpec(key, "ChaCha20")
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, IvParameterSpec(buildNonce(sessionId, sequence, isMic = isMic)))
+            cipher.updateAAD(headerAad)
+            return cipher.doFinal(plaintext, plaintextOffset, plaintextLength)
+        } catch (e: Exception) {
+            throw AeadException("failed to encrypt audio payload (seq=$sequence)", e)
+        }
+    }
+
     fun randomSessionId(): ByteArray = ByteArray(SESSION_ID_LEN).also { SecureRandom().nextBytes(it) }
 
-    private fun buildNonce(sessionId: ByteArray, sequence: UInt): ByteArray {
+    private fun buildNonce(sessionId: ByteArray, sequence: UInt, isMic: Boolean = false): ByteArray {
         require(sessionId.size == SESSION_ID_LEN) { "session ID must be $SESSION_ID_LEN bytes" }
         val nonce = ByteArray(NONCE_LEN)
         sessionId.copyInto(nonce, 0)
-        nonce[8] = (sequence.toInt() ushr 24).toByte()
-        nonce[9] = (sequence.toInt() ushr 16).toByte()
-        nonce[10] = (sequence.toInt() ushr 8).toByte()
-        nonce[11] = sequence.toInt().toByte()
+        // Set MSB (bit 31) as Direction Bit (0 = laptop->phone, 1 = phone->laptop)
+        val dirSeq = if (isMic) (sequence or 0x80000000u) else (sequence and 0x7FFFFFFFu)
+        nonce[8] = (dirSeq.toInt() ushr 24).toByte()
+        nonce[9] = (dirSeq.toInt() ushr 16).toByte()
+        nonce[10] = (dirSeq.toInt() ushr 8).toByte()
+        nonce[11] = dirSeq.toInt().toByte()
         return nonce
     }
 

@@ -31,6 +31,16 @@ void chacha20_poly1305_seal(const uint8_t key[32],
                             uint8_t* out_ciphertext,
                             uint8_t out_tag[16]);
 
+// ChaCha20-Poly1305 AEAD decrypt (RFC 8439)
+// out_plaintext must have room for ciphertext_len bytes.
+// Returns true on successful tag verification and decryption, false on authentication failure.
+bool chacha20_poly1305_open(const uint8_t key[32],
+                            const uint8_t nonce[12],
+                            const uint8_t* aad, size_t aad_len,
+                            const uint8_t* ciphertext, size_t ciphertext_len,
+                            const uint8_t in_tag[16],
+                            uint8_t* out_plaintext);
+
 // Constant-time memory comparison to prevent timing attacks
 bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t len);
 bool constant_time_eq_str(const std::string& a, const std::string& b);

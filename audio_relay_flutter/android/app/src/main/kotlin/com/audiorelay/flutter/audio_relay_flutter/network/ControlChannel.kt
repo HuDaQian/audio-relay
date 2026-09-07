@@ -55,7 +55,7 @@ class ControlChannel(
     class PairingRejected(message: String) : IOException(message)
 
     /** Connects and exchanges HELLO/HELLO_ACK. Caller decides pair vs. repair from the result. */
-    suspend fun connect(): ControlMessage.HelloAck = withContext(Dispatchers.IO) {
+    suspend fun connect(streamMode: String = "speaker"): ControlMessage.HelloAck = withContext(Dispatchers.IO) {
         val s = Socket()
         s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
         s.tcpNoDelay = true
@@ -63,7 +63,7 @@ class ControlChannel(
         reader = s.getInputStream().bufferedReader()
         writer = s.getOutputStream().bufferedWriter()
 
-        send(ControlMessage.Hello(PROTOCOL_VERSION, deviceId, deviceName, audioPort))
+        send(ControlMessage.Hello(PROTOCOL_VERSION, deviceId, deviceName, audioPort, stream_mode = streamMode))
         readNextMessage() as? ControlMessage.HelloAck
             ?: throw ControlChannelException("expected HELLO_ACK as the first reply")
     }
@@ -76,14 +76,20 @@ class ControlChannel(
      * does the same on its side once it verifies the proof) rather than
      * have it transmitted back to us. See protocol-spec.md §5.
      */
-    suspend fun pairWithCode(code: String, nonce: String, laptopDeviceId: String, laptopDeviceName: String): Paired =
+    suspend fun pairWithCode(
+        code: String,
+        nonce: String,
+        laptopDeviceId: String,
+        laptopDeviceName: String,
+        streamMode: String = "speaker",
+    ): Paired =
         withContext(Dispatchers.IO) {
             val proof = Crypto.computePairProof(code, deviceId, nonce)
             send(ControlMessage.PairRequest(proof))
             when (val reply = readNextMessage()) {
                 is ControlMessage.PairOk -> {
                     val sessionKey = Crypto.deriveSessionKey(code, deviceId, laptopDeviceId)
-                    finishPairing(laptopDeviceId, laptopDeviceName, sessionKey, reply.session_id)
+                    finishPairing(laptopDeviceId, laptopDeviceName, sessionKey, reply.session_id, streamMode)
                 }
                 is ControlMessage.PairFail -> throw PairingRejected(reply.reason)
                 else -> throw ControlChannelException("unexpected message while pairing: $reply")
@@ -91,12 +97,18 @@ class ControlChannel(
         }
 
     /** Reconnect using a previously-derived key — no code re-entry. */
-    suspend fun repair(laptopDeviceId: String, laptopDeviceName: String, savedKey: ByteArray, nonce: String): Paired =
+    suspend fun repair(
+        laptopDeviceId: String,
+        laptopDeviceName: String,
+        savedKey: ByteArray,
+        nonce: String,
+        streamMode: String = "speaker",
+    ): Paired =
         withContext(Dispatchers.IO) {
             val proof = Crypto.computeRepairProof(savedKey, deviceId, nonce)
             send(ControlMessage.Repair(deviceId, proof))
             when (val reply = readNextMessage()) {
-                is ControlMessage.PairOk -> finishPairing(laptopDeviceId, laptopDeviceName, savedKey, reply.session_id)
+                is ControlMessage.PairOk -> finishPairing(laptopDeviceId, laptopDeviceName, savedKey, reply.session_id, streamMode)
                 is ControlMessage.PairFail -> throw PairingRejected(reply.reason)
                 else -> throw ControlChannelException("unexpected message while reconnecting: $reply")
             }
@@ -107,20 +119,20 @@ class ControlChannel(
         laptopDeviceName: String,
         sessionKey: ByteArray,
         sessionIdHex: String,
+        streamMode: String = "speaker",
     ): Paired {
         val laptopCaps = readNextMessage() as? ControlMessage.Capabilities
             ?: throw ControlChannelException("expected CAPABILITIES after PAIR_OK")
-        // Ack with the same values — this app plays back whatever the
-        // laptop is actually capturing (protocol-spec.md §3 makes the
-        // per-packet header authoritative regardless).
-        send(ControlMessage.Capabilities(laptopCaps.sample_rate, laptopCaps.channels))
+        // Ack with capabilities, including the negotiated stream_mode
+        val channels = if (streamMode == "microphone") 1 else laptopCaps.channels
+        send(ControlMessage.Capabilities(laptopCaps.sample_rate, channels, stream_mode = streamMode))
         return Paired(
             laptopDeviceId = laptopDeviceId,
             laptopDeviceName = laptopDeviceName,
             sessionId = Crypto.hexToBytes(sessionIdHex),
             sessionKey = sessionKey,
             sampleRateHz = laptopCaps.sample_rate,
-            channels = laptopCaps.channels,
+            channels = channels,
         )
     }
 

@@ -399,6 +399,75 @@ void chacha20_poly1305_seal(const uint8_t key[32],
     poly1305_finish(&poly, out_tag);
 }
 
+bool chacha20_poly1305_open(const uint8_t key[32],
+                            const uint8_t nonce[12],
+                            const uint8_t* aad, size_t aad_len,
+                            const uint8_t* ciphertext, size_t ciphertext_len,
+                            const uint8_t in_tag[16],
+                            uint8_t* out_plaintext) {
+    // 1. Generate Poly1305 one-time key with counter = 0
+    uint32_t state[16];
+    chacha20_init_state(state, key, nonce, 0);
+    uint8_t poly_key_block[64];
+    chacha20_block(state, poly_key_block);
+
+    // 2. Verify Poly1305 MAC over: aad || pad16(aad) || ciphertext || pad16(ciphertext) || len(aad) || len(ciphertext)
+    Poly1305Ctx poly;
+    poly1305_init(&poly, poly_key_block);
+
+    if (aad_len > 0) {
+        poly1305_blocks(&poly, aad, (aad_len / 16) * 16, false);
+        size_t rem = aad_len % 16;
+        if (rem > 0) {
+            uint8_t pad[16] = {0};
+            std::memcpy(pad, aad + (aad_len - rem), rem);
+            poly1305_blocks(&poly, pad, 16, false);
+        }
+    }
+
+    if (ciphertext_len > 0) {
+        poly1305_blocks(&poly, ciphertext, (ciphertext_len / 16) * 16, false);
+        size_t rem = ciphertext_len % 16;
+        if (rem > 0) {
+            uint8_t pad[16] = {0};
+            std::memcpy(pad, ciphertext + (ciphertext_len - rem), rem);
+            poly1305_blocks(&poly, pad, 16, false);
+        }
+    }
+
+    uint8_t lens[16];
+    uint64_t aad_len_le = (uint64_t)aad_len;
+    uint64_t ct_len_le = (uint64_t)ciphertext_len;
+    for (int b = 0; b < 8; b++) {
+        lens[b] = (uint8_t)(aad_len_le >> (b * 8));
+        lens[8 + b] = (uint8_t)(ct_len_le >> (b * 8));
+    }
+    poly1305_blocks(&poly, lens, 16, false);
+
+    uint8_t calculated_tag[16];
+    poly1305_finish(&poly, calculated_tag);
+
+    if (!constant_time_eq(calculated_tag, in_tag, 16)) {
+        return false;
+    }
+
+    // 3. Decrypt ciphertext with counter = 1
+    uint32_t counter = 1;
+    size_t i = 0;
+    while (i < ciphertext_len) {
+        chacha20_init_state(state, key, nonce, counter++);
+        uint8_t key_stream[64];
+        chacha20_block(state, key_stream);
+        size_t block_len = std::min((size_t)64, ciphertext_len - i);
+        for (size_t b = 0; b < block_len; b++) {
+            out_plaintext[i + b] = ciphertext[i + b] ^ key_stream[b];
+        }
+        i += block_len;
+    }
+
+    return true;
+}
+
 bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t len) {
     uint8_t result = 0;
     for (size_t i = 0; i < len; i++) {

@@ -55,12 +55,14 @@ class RelayBridge(private val context: Context, messenger: BinaryMessenger) : Me
                 val port = call.argument<Int>("port") ?: 45108
                 val deviceId = call.argument<String>("deviceId") ?: "desktop-$host-$port"
                 val name = call.argument<String>("name") ?: (if (host == "127.0.0.1") "USB 有线电脑" else "电脑")
+                val mode = call.argument<String>("mode") ?: "speaker"
                 val intent = Intent(context, RelayService::class.java).apply {
                     action = RelayService.ACTION_CONNECT
                     putExtra(RelayService.EXTRA_DEVICE_ID, deviceId)
                     putExtra(RelayService.EXTRA_NAME, name)
                     putExtra(RelayService.EXTRA_HOST, host)
                     putExtra(RelayService.EXTRA_PORT, port)
+                    putExtra(RelayService.EXTRA_STREAM_MODE, mode)
                 }
                 context.startForegroundService(intent)
                 result.success(true)

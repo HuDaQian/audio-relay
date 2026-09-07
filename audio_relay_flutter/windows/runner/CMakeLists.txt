@@ -13,6 +13,7 @@ add_executable(${BINARY_NAME} WIN32
   "win32_window.cpp"
   "crypto.cpp"
   "wasapi_capture.cpp"
+  "wasapi_render.cpp"
   "audio_relay_server.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
@@ -38,7 +39,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "_WINSOCK_DEPRECATED_NO_WARNIN
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
-target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ws2_32.lib" "ole32.lib" "avrt.lib" "bcrypt.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ws2_32.lib" "ole32.lib" "avrt.lib" "bcrypt.lib" "propsys.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

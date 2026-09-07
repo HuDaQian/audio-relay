@@ -58,6 +58,35 @@ object AudioPacket {
         )
     }
 
+    /**
+     * Encodes a 13-byte fixed header into [dest] starting at [offset].
+     */
+    fun encodeHeader(
+        sequence: UInt,
+        timestampMs: UInt,
+        sampleRateHz: Int = 48_000,
+        channels: Int = 1,
+        codec: Int = CODEC_RAW_PCM,
+        dest: ByteArray,
+        offset: Int = 0,
+    ) {
+        require(dest.size >= offset + HEADER_LEN) { "dest buffer too small for header" }
+        dest[offset] = codec.toByte()
+        writeU32BE(dest, offset + 1, sequence)
+        writeU32BE(dest, offset + 5, timestampMs)
+        dest[offset + 9] = if (sampleRateHz == 44_100) 0.toByte() else 1.toByte()
+        dest[offset + 10] = channels.toByte()
+        dest[offset + 11] = 0
+        dest[offset + 12] = 0
+    }
+
+    private fun writeU32BE(buffer: ByteArray, offset: Int, value: UInt) {
+        buffer[offset] = ((value shr 24) and 0xFFu).toByte()
+        buffer[offset + 1] = ((value shr 16) and 0xFFu).toByte()
+        buffer[offset + 2] = ((value shr 8) and 0xFFu).toByte()
+        buffer[offset + 3] = (value and 0xFFu).toByte()
+    }
+
     private fun readU32BE(buffer: ByteArray, offset: Int): UInt {
         return ((buffer[offset].toUInt() and 0xFFu) shl 24) or
             ((buffer[offset + 1].toUInt() and 0xFFu) shl 16) or

@@ -5,6 +5,8 @@ import Network
 import CryptoKit
 import ScreenCaptureKit
 import AVFoundation
+import AudioToolbox
+import CoreAudio
 import OSLog
 
 @main
@@ -44,6 +46,20 @@ class AppDelegate: FlutterAppDelegate {
         case "regenerateCode":
           server.generateNewPairCode()
           result(server.pairCode)
+        case "getOutputDevices":
+          result(server.enumerateOutputDevices())
+        case "setOutputDevice":
+          if let args = call.arguments as? [String: Any], let id = args["id"] as? String {
+            server.setOutputDevice(id: id)
+          }
+          result(true)
+        case "setStreamMode":
+          if let args = call.arguments as? [String: Any], let mode = args["mode"] as? String {
+            server.setStreamMode(mode: mode)
+          }
+          result(true)
+        case "getStreamMode":
+          result(server.streamMode)
         default:
           result(FlutterMethodNotImplemented)
         }
@@ -204,6 +220,120 @@ class MacAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - MacAudioPlayer (AudioQueue for virtual audio output)
+
+class MacAudioPlayer {
+    private var queue: AudioQueueRef?
+    private(set) var isRunning: Bool = false
+    private var currentDeviceUID: String?
+
+    private let bufferCount = 4
+    private let bufferByteSize: UInt32 = 4096
+    private var freeBuffers: [AudioQueueBufferRef] = []
+    private let bufferLock = NSLock()
+
+    func start(deviceUID: String? = nil) {
+        stop()
+        currentDeviceUID = deviceUID
+
+        var desc = AudioStreamBasicDescription(
+            mSampleRate: 48000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+
+        let callback: AudioQueueOutputCallback = { userData, inAQ, inBuffer in
+            guard let ptr = userData else { return }
+            let player = Unmanaged<MacAudioPlayer>.fromOpaque(ptr).takeUnretainedValue()
+            player.recycleBuffer(inBuffer)
+        }
+
+        let userPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let status = AudioQueueNewOutput(&desc, callback, userPtr, nil, nil, 0, &queue)
+        guard status == noErr, let q = queue else {
+            os_log("Failed to create AudioQueue for output: %d", status)
+            return
+        }
+
+        if let uid = deviceUID, !uid.isEmpty {
+            var cfUid = uid as CFString
+            AudioQueueSetProperty(q, kAudioQueueProperty_CurrentDevice, &cfUid, UInt32(MemoryLayout<CFString>.size))
+        }
+
+        // Pre-allocate buffer pool to eliminate heap allocations on the audio hot-path
+        bufferLock.lock()
+        freeBuffers.removeAll()
+        for _ in 0..<bufferCount {
+            var buf: AudioQueueBufferRef?
+            if AudioQueueAllocateBuffer(q, bufferByteSize, &buf) == noErr, let b = buf {
+                freeBuffers.append(b)
+            }
+        }
+        bufferLock.unlock()
+
+        AudioQueueStart(q, nil)
+        isRunning = true
+    }
+
+    fileprivate func recycleBuffer(_ buffer: AudioQueueBufferRef) {
+        bufferLock.lock()
+        freeBuffers.append(buffer)
+        bufferLock.unlock()
+    }
+
+    func stop() {
+        isRunning = false
+        if let q = queue {
+            AudioQueueStop(q, true)
+            AudioQueueDispose(q, true)
+            queue = nil
+        }
+        bufferLock.lock()
+        freeBuffers.removeAll()
+        bufferLock.unlock()
+    }
+
+    func writePcm(_ pcm: Data, channels: Int = 1) {
+        guard let q = queue, isRunning, !pcm.isEmpty else { return }
+
+        // If input is mono 16-bit, duplicate samples into stereo (L=R) for BlackHole 2ch compatibility
+        var stereoData: Data
+        if channels == 1 {
+            stereoData = Data(count: pcm.count * 2)
+            let inCount = pcm.count / 2
+            pcm.withUnsafeBytes { inRaw in
+                let inPtr = inRaw.bindMemory(to: Int16.self)
+                stereoData.withUnsafeMutableBytes { outRaw in
+                    let outPtr = outRaw.bindMemory(to: Int16.self)
+                    for i in 0..<inCount {
+                        outPtr[i * 2] = inPtr[i]
+                        outPtr[i * 2 + 1] = inPtr[i]
+                    }
+                }
+            }
+        } else {
+            stereoData = pcm
+        }
+
+        bufferLock.lock()
+        let availableBuf = freeBuffers.popLast()
+        bufferLock.unlock()
+
+        if let buf = availableBuf {
+            let copyLen = min(Int(bufferByteSize), stereoData.count)
+            stereoData.copyBytes(to: buf.pointee.mAudioData.assumingMemoryBound(to: UInt8.self), count: copyLen)
+            buf.pointee.mAudioDataByteSize = UInt32(copyLen)
+            AudioQueueEnqueueBuffer(q, buf, 0, nil)
+        }
+    }
+}
+
 // MARK: - MacAudioRelayServer
 
 @available(macOS 13.0, *)
@@ -212,6 +342,10 @@ class MacAudioRelayServer {
 
     let port: UInt16 = 45108
     let audioTcpPort: UInt16 = 45109
+
+    private(set) var streamMode: String = "speaker"
+    private var selectedOutputDeviceUID: String?
+    private var player = MacAudioPlayer()
 
     private(set) var pairCode: String = ""
     private(set) var pairCodeCreatedAt: Date = Date()
@@ -420,7 +554,193 @@ class MacAudioRelayServer {
         }
     }
 
+    func enumerateOutputDevices() -> [[String: Any]] {
+        var devices: [[String: Any]] = []
+        var propertySize: UInt32 = 0
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propertySize)
+        guard status == noErr else { return devices }
+
+        let count = Int(propertySize / UInt32(MemoryLayout<AudioDeviceID>.size))
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
+        let getStatus = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propertySize, &deviceIDs)
+        guard getStatus == noErr else { return devices }
+
+        var defaultOutputDeviceID: AudioDeviceID = 0
+        var defaultSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var defaultAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &defaultAddress, 0, nil, &defaultSize, &defaultOutputDeviceID)
+
+        for devId in deviceIDs {
+            // Check if device has output streams
+            var streamAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var streamSize: UInt32 = 0
+            if AudioObjectGetPropertyDataSize(devId, &streamAddress, 0, nil, &streamSize) != noErr || streamSize == 0 {
+                continue
+            }
+
+            // Name
+            var nameAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceNameCFString,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var nameCF: CFString = "" as CFString
+            var nameSize = UInt32(MemoryLayout<CFString>.size)
+            if AudioObjectGetPropertyData(devId, &nameAddress, 0, nil, &nameSize, &nameCF) != noErr {
+                continue
+            }
+            let name = nameCF as String
+
+            // UID
+            var uidAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var uidCF: CFString = "" as CFString
+            var uidSize = UInt32(MemoryLayout<CFString>.size)
+            if AudioObjectGetPropertyData(devId, &uidAddress, 0, nil, &uidSize, &uidCF) != noErr {
+                continue
+            }
+            let uid = uidCF as String
+
+            let isDefault = (devId == defaultOutputDeviceID)
+            let lower = name.lowercased()
+            let isVirtual = lower.contains("blackhole") || lower.contains("vb-audio") ||
+                            lower.contains("cable") || lower.contains("soundflower") ||
+                            lower.contains("loopback") || lower.contains("virtual")
+
+            devices.append([
+                "id": uid,
+                "name": name,
+                "is_default": isDefault,
+                "is_virtual": isVirtual
+            ])
+        }
+
+        return devices
+    }
+
+    func setOutputDevice(id: String) {
+        stateLock.lock()
+        selectedOutputDeviceUID = id
+        stateLock.unlock()
+        if streamMode == "microphone" && player.isRunning {
+            player.start(deviceUID: id)
+        }
+    }
+
+    func autoDetectVirtualDevice() -> String? {
+        let devices = enumerateOutputDevices()
+        for d in devices {
+            if let isVirt = d["is_virtual"] as? Bool, isVirt, let uid = d["id"] as? String {
+                return uid
+            }
+        }
+        return nil
+    }
+
+    func setStreamMode(mode: String) {
+        stateLock.lock()
+        streamMode = mode
+        stateLock.unlock()
+
+        if mode == "microphone" {
+            Task {
+                await capture.stop()
+            }
+            setCapturingState(false)
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+        } else {
+            player.stop()
+            triggerStartCapture()
+        }
+    }
+
+    private func processIncomingAudioPacket(_ data: Data) {
+        guard data.count >= 13 + 16 else { return } // header + tag
+
+        let header = data.subdata(in: 0..<13)
+        let ciphertextAndTag = data.subdata(in: 13..<data.count)
+
+        stateLock.lock()
+        guard let key = sessionKey, let sessId = sessionId else {
+            stateLock.unlock()
+            return
+        }
+        stateLock.unlock()
+
+        let seqBE = header.subdata(in: 1..<5)
+        var nonceData = Data(sessId)
+        var seqVal = seqBE.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        // Incoming packet is Phone -> Laptop (Microphone): set Direction Bit (bit 31 = 1)
+        seqVal |= 0x80000000
+        var dirSeqBE = seqVal.bigEndian
+        withUnsafeBytes(of: &dirSeqBE) { nonceData.append(contentsOf: $0) }
+
+        guard let nonce = try? ChaChaPoly.Nonce(data: nonceData) else { return }
+
+        let tagIndex = ciphertextAndTag.count - 16
+        let ciphertext = ciphertextAndTag.subdata(in: 0..<tagIndex)
+        let tag = ciphertextAndTag.subdata(in: tagIndex..<ciphertextAndTag.count)
+
+        guard let sealedBox = try? ChaChaPoly.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag) else {
+            return
+        }
+
+        guard let decrypted = try? ChaChaPoly.open(sealedBox, using: key, authenticating: header) else {
+            return
+        }
+
+        if streamMode == "microphone" {
+            let channels = Int(header[10])
+            player.writePcm(decrypted, channels: channels > 0 ? channels : 1)
+        }
+    }
+
+    func listenUdpAudio(conn: NWConnection) {
+        conn.receiveMessage { [weak self] content, _, isComplete, error in
+            guard let self = self else { return }
+            if let data = content, !data.isEmpty {
+                self.processIncomingAudioPacket(data)
+            }
+            if error == nil && !isComplete {
+                self.listenUdpAudio(conn: conn)
+            }
+        }
+    }
+
+    func listenTcpAudio(conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 2, maximumLength: 2) { [weak self] lenData, _, isComplete, error in
+            guard let self = self, let lenData = lenData, lenData.count == 2, error == nil else { return }
+            let len = Int(lenData[0]) << 8 | Int(lenData[1])
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] bodyData, _, isComp, err in
+                guard let self = self, let bodyData = bodyData, bodyData.count == len, err == nil else { return }
+                self.processIncomingAudioPacket(bodyData)
+                self.listenTcpAudio(conn: conn)
+            }
+        }
+    }
+
     func triggerStartCapture() {
+        if streamMode == "microphone" {
+            return
+        }
         stateLock.lock()
         if _isCapturing {
             stateLock.unlock()
@@ -450,7 +770,9 @@ class MacAudioRelayServer {
     }
 
     private func startCapture() {
-        triggerStartCapture()
+        if streamMode != "microphone" {
+            triggerStartCapture()
+        }
     }
 
     private func startTcpControlListener() {
@@ -496,6 +818,7 @@ class MacAudioRelayServer {
                 oldConn?.cancel()
                 newConn.start(queue: .global())
                 os_log("TCP Audio Channel connected on port %d", self.audioTcpPort)
+                self.listenTcpAudio(conn: newConn)
             }
             listener.start(queue: .main)
             self.tcpAudioListener = listener
@@ -591,6 +914,9 @@ class MacAudioRelayServer {
         let clientName = json["device_name"] as? String ?? "Android"
         let clientAudioPort = json["audio_port"] as? Int ?? 45108
         let reqDevId = json["device_id"] as? String ?? ""
+        if let mode = json["stream_mode"] as? String {
+            setStreamMode(mode: mode)
+        }
 
         var nonceBytes = [UInt8](repeating: 0, count: 8)
         _ = SecRandomCopyBytes(kSecRandomDefault, 8, &nonceBytes)
@@ -620,6 +946,7 @@ class MacAudioRelayServer {
             self.activeUdpConnection?.cancel()
             self.activeUdpConnection = udpConn
             stateLock.unlock()
+            listenUdpAudio(conn: udpConn)
         }
 
         onStatusChanged?("pairing", clientName)
@@ -681,11 +1008,17 @@ class MacAudioRelayServer {
         let caps: [String: Any] = [
             "type": "CAPABILITIES",
             "sample_rate": 48000,
-            "channels": 2
+            "channels": 2,
+            "stream_mode": streamMode
         ]
         sendJson(caps, to: conn)
 
-        triggerStartCapture()
+        if streamMode == "microphone" {
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+        } else {
+            triggerStartCapture()
+        }
         onStatusChanged?("streaming", "Android 手机")
     }
 
@@ -724,8 +1057,19 @@ class MacAudioRelayServer {
         stateLock.unlock()
 
         sendJson(["type": "PAIR_OK", "session_id": sessIdHex], to: conn)
-        sendJson(["type": "CAPABILITIES", "sample_rate": 48000, "channels": 2], to: conn)
-        triggerStartCapture()
+        let caps: [String: Any] = [
+            "type": "CAPABILITIES",
+            "sample_rate": 48000,
+            "channels": 2,
+            "stream_mode": streamMode
+        ]
+        sendJson(caps, to: conn)
+        if streamMode == "microphone" {
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+        } else {
+            triggerStartCapture()
+        }
         onStatusChanged?("streaming", "Android 手机")
     }
 

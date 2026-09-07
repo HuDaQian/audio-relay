@@ -15,6 +15,7 @@ sealed class ControlMessage {
         val device_id: String,
         val device_name: String,
         val audio_port: Int,
+        val stream_mode: String? = null,
     ) : ControlMessage()
 
     data class HelloAck(
@@ -35,7 +36,11 @@ sealed class ControlMessage {
 
     data class PairFail(val reason: String) : ControlMessage()
 
-    data class Capabilities(val sample_rate: Int, val channels: Int) : ControlMessage()
+    data class Capabilities(
+        val sample_rate: Int,
+        val channels: Int,
+        val stream_mode: String? = null,
+    ) : ControlMessage()
 
     data class Ping(val t: Long) : ControlMessage()
 
@@ -53,6 +58,9 @@ sealed class ControlMessage {
                 obj.put("device_id", device_id)
                 obj.put("device_name", device_name)
                 obj.put("audio_port", audio_port)
+                if (stream_mode != null) {
+                    obj.put("stream_mode", stream_mode)
+                }
             }
             is HelloAck -> {
                 obj.put("type", "HELLO_ACK")
@@ -83,6 +91,9 @@ sealed class ControlMessage {
                 obj.put("type", "CAPABILITIES")
                 obj.put("sample_rate", sample_rate)
                 obj.put("channels", channels)
+                if (stream_mode != null) {
+                    obj.put("stream_mode", stream_mode)
+                }
             }
             is Ping -> {
                 obj.put("type", "PING")
@@ -110,7 +121,8 @@ sealed class ControlMessage {
                         obj.getInt("protocol_version"),
                         obj.getString("device_id"),
                         obj.getString("device_name"),
-                        obj.getInt("audio_port")
+                        obj.getInt("audio_port"),
+                        obj.optString("stream_mode").takeIf { it.isNotEmpty() }
                     )
                     "HELLO_ACK" -> HelloAck(
                         obj.getInt("protocol_version"),
@@ -123,7 +135,11 @@ sealed class ControlMessage {
                     "REPAIR" -> Repair(obj.getString("device_id"), obj.getString("proof"))
                     "PAIR_OK" -> PairOk(obj.getString("session_id"))
                     "PAIR_FAIL" -> PairFail(obj.getString("reason"))
-                    "CAPABILITIES" -> Capabilities(obj.getInt("sample_rate"), obj.getInt("channels"))
+                    "CAPABILITIES" -> Capabilities(
+                        obj.getInt("sample_rate"),
+                        obj.getInt("channels"),
+                        obj.optString("stream_mode").takeIf { it.isNotEmpty() }
+                    )
                     "PING" -> Ping(obj.getLong("t"))
                     "PONG" -> Pong(obj.getLong("t"))
                     "BYE" -> Bye

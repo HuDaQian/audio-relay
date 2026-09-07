@@ -82,13 +82,12 @@ to run the jitter buffer even on a packet it ultimately fails to decrypt) is
 encrypted with **ChaCha20-Poly1305**, using:
 
 - **Key:** the 32-byte session key derived in §5.
-- **Nonce:** 12 bytes, constructed as `session_id (8 bytes) || sequence (4
-  bytes, big-endian)`. `session_id` is a random 8-byte value chosen by the
-  laptop at pairing/reconnect time and sent in `PAIR_OK`/`CAPABILITIES`;
-  reusing `sequence` (already in the header) as part of the nonce means we
-  don't need a separate counter, but it means **a session key must never be
-  reused across sessions with the same `session_id`** — always mint a new
-  random `session_id` per connection.
+- **Nonce:** 12 bytes, constructed as `session_id (8 bytes) || dir_and_sequence (4 bytes, big-endian)`.
+  - `session_id` is a random 8-byte value chosen by the laptop at pairing/reconnect time and sent in `PAIR_OK`/`CAPABILITIES`.
+  - To guarantee that full-duplex operation (Phase 2, where both laptop and phone transmit concurrently with their own sequences starting from 0) never causes a catastrophic key+nonce reuse, the most significant bit (bit 31) of the 4-byte sequence field in the nonce acts as the **Direction Bit**:
+    - `0` for **Laptop -> Phone** (speaker streaming mode). Nonce = `session_id (8B) || (sequence & 0x7FFFFFFF)`.
+    - `1` for **Phone -> Laptop** (microphone streaming mode). Nonce = `session_id (8B) || (sequence | 0x80000000)`.
+    *(Note: On the wire in the 13-byte unencrypted packet header, the sequence field transmits normally without modification; only when computing/verifying the 12-byte AEAD Nonce is bit 31 set according to stream direction).*
 - The Poly1305 authentication tag (16 bytes) is appended after the
   encrypted payload. A receiver that fails authentication must drop the
   packet (treat as loss for jitter-buffer purposes) and must not play the
@@ -143,13 +142,13 @@ independently (see §5).
 
 | `type` | Sender | Fields | Purpose |
 |---|---|---|---|
-| `HELLO` | phone | `protocol_version`, `device_id`, `device_name`, `audio_port` | Opens the session, announces the phone's identity, protocol version, and the UDP port it has already bound and is listening on for audio (not necessarily the same as the TCP control port). The laptop sends audio datagrams to `(tcp_peer_ip, audio_port)`. |
+| `HELLO` | phone | `protocol_version`, `device_id`, `device_name`, `audio_port`, `stream_mode` (optional) | Opens the session, announces the phone's identity, protocol version, and the UDP port it has already bound and is listening on for audio (not necessarily the same as the TCP control port). `stream_mode`: `"speaker"` (default) or `"microphone"`. The laptop sends audio datagrams to `(tcp_peer_ip, audio_port)` in speaker mode, or listens for phone audio datagrams in microphone mode. |
 | `HELLO_ACK` | laptop | `protocol_version`, `device_id`, `device_name`, `paired: bool`, `nonce` (hex, 8 bytes) | Laptop's identity; `paired` tells the phone whether this laptop already remembers it (send `REPAIR`) or needs `PAIR_REQUEST`. `nonce` is a fresh random value, **always sent** (not just on the `paired` path), used as the challenge for whichever proof the phone sends next. |
 | `PAIR_REQUEST` | phone | `proof` (hex) | First-time pairing. `proof` = `HMAC-SHA256(code, phone_device_id \|\| nonce_from_HELLO_ACK)`, hex-encoded, where `code` is the 6-digit code the user read off the laptop's UI and typed into the phone. **The code itself is never sent** — this proves the phone's user typed the same code the laptop is displaying, without putting it on the wire. See §5. |
 | `REPAIR` | phone | `device_id`, `proof` | Reconnecting a previously-paired device. `proof` = `HMAC-SHA256(persisted_key, device_id \|\| nonce_from_HELLO_ACK)`, hex-encoded. Proves the phone holds the previously-derived key without resending it. |
 | `PAIR_OK` | laptop | `session_id` (hex, 8 bytes) | Pairing/reconnect succeeded. No key material is ever included — on both `PAIR_REQUEST` and `REPAIR`, each side independently derives (or already holds) the same session key; see §5. `session_id` seeds the UDP nonce (§3.1). |
 | `PAIR_FAIL` | laptop | `reason` | Wrong code / unknown device_id / bad proof. Phone should let the user retry (same connection, same `nonce` — see §5). |
-| `CAPABILITIES` | both | `sample_rate` (Hz), `channels` | Exchanged after pairing so both sides agree on format before audio starts. Laptop sends what it's actually capturing; phone acks with what it will play (normally matches — see §3, receivers should still honor the header per-packet). |
+| `CAPABILITIES` | both | `sample_rate` (Hz), `channels`, `stream_mode` (optional) | Exchanged after pairing so both sides agree on format before audio starts. In microphone mode, `channels` is typically `1` (mono) and `sample_rate` is `48000`. Laptop receives and renders to virtual audio cable; phone captures from mic. |
 | `PING` | either | `t` (sender's monotonic ms) | Heartbeat, sent every 1s by both sides independently. |
 | `PONG` | either | `t` (echoed from the `PING`) | Reply to `PING`. 3 consecutive missed `PONG`s (3s) ⇒ treat as disconnected, close sockets, laptop stops sending audio, phone starts mDNS re-browse with exponential backoff (see `docs/architecture.md` §7). |
 | `BYE` | either | — | Clean disconnect notice, sent before closing the socket on purpose (user hit Stop/Disconnect). Distinguishes an intentional stop from a dropped connection so the other side doesn't immediately try to reconnect. |

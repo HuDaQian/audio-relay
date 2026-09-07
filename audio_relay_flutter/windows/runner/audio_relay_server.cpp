@@ -239,10 +239,15 @@ void WindowsAudioRelayServer::Start() {
 
     tcp_control_thread_ = std::thread(&WindowsAudioRelayServer::TcpControlLoop, this);
     tcp_audio_thread_ = std::thread(&WindowsAudioRelayServer::TcpAudioLoop, this);
+    udp_audio_receive_thread_ = std::thread(&WindowsAudioRelayServer::UdpAudioReceiveLoop, this);
     adb_thread_ = std::thread(&WindowsAudioRelayServer::AdbSupervisorLoop, this);
     mdns_thread_ = std::thread(&WindowsAudioRelayServer::MdnsLoop, this);
 
-    TriggerStartCapture();
+    if (stream_mode_ == "microphone") {
+        render_.Start(selected_output_device_);
+    } else {
+        TriggerStartCapture();
+    }
 }
 
 void WindowsAudioRelayServer::Stop() {
@@ -250,6 +255,7 @@ void WindowsAudioRelayServer::Stop() {
 
     is_running_.store(false);
     capture_.Stop();
+    render_.Stop();
 
     if (tcp_control_listen_sock_ != INVALID_SOCKET) {
         closesocket(tcp_control_listen_sock_);
@@ -274,13 +280,63 @@ void WindowsAudioRelayServer::Stop() {
 
     if (tcp_control_thread_.joinable()) tcp_control_thread_.join();
     if (tcp_audio_thread_.joinable()) tcp_audio_thread_.join();
+    if (udp_audio_receive_thread_.joinable()) udp_audio_receive_thread_.join();
     if (adb_thread_.joinable()) adb_thread_.join();
     if (mdns_thread_.joinable()) mdns_thread_.join();
 
     WSACleanup();
 }
 
+void WindowsAudioRelayServer::SetStreamMode(const std::string& mode) {
+    std::string prev_mode;
+    std::string chosen_device;
+    {
+        std::lock_guard<std::mutex> lock(mode_mutex_);
+        prev_mode = stream_mode_;
+        stream_mode_ = mode;
+        chosen_device = selected_output_device_;
+    }
+
+    if (mode == prev_mode) return;
+
+    // Do stop and start outside of any mutex to avoid deadlocks with threads trying to acquire locks
+    if (mode == "microphone") {
+        capture_.Stop(); // Thread join happens here safely outside mutex
+        render_.Start(chosen_device);
+    } else {
+        render_.Stop();
+        TriggerStartCapture();
+    }
+}
+
+std::string WindowsAudioRelayServer::GetStreamMode() const {
+    std::lock_guard<std::mutex> lock(mode_mutex_);
+    return stream_mode_;
+}
+
+void WindowsAudioRelayServer::SetOutputDevice(const std::string& device_id) {
+    std::string cur_mode;
+    {
+        std::lock_guard<std::mutex> lock(mode_mutex_);
+        selected_output_device_ = device_id;
+        cur_mode = stream_mode_;
+    }
+    if (cur_mode == "microphone" && render_.IsRunning()) {
+        render_.Stop();
+        render_.Start(device_id);
+    }
+}
+
+std::string WindowsAudioRelayServer::GetSelectedOutputDevice() const {
+    std::lock_guard<std::mutex> lock(mode_mutex_);
+    return selected_output_device_;
+}
+
 void WindowsAudioRelayServer::TriggerStartCapture() {
+    {
+        std::lock_guard<std::mutex> lock(mode_mutex_);
+        if (stream_mode_ == "microphone") return;
+    }
     if (capture_.IsRunning()) return;
 
     capture_.Start([this](const std::vector<uint8_t>& pcm) {
@@ -335,6 +391,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 if (client_name.empty()) client_name = "Android";
                 int client_audio_port = ExtractJsonInt(line, "audio_port", 45108);
                 local_client_device_id = ExtractJsonString(line, "device_id");
+                std::string req_mode = ExtractJsonString(line, "stream_mode");
 
                 uint8_t nonce_bytes[8];
                 GetSecureRandomBytes(nonce_bytes, sizeof(nonce_bytes));
@@ -344,6 +401,10 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 {
                     std::lock_guard<std::mutex> lock(net_mutex_);
                     is_paired = (paired_keys_.find(local_client_device_id) != paired_keys_.end());
+                }
+                if (!req_mode.empty()) {
+                    std::lock_guard<std::mutex> lock(mode_mutex_);
+                    stream_mode_ = req_mode;
                 }
 
                 std::ostringstream oss;
@@ -395,6 +456,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
 
                 if (!client_proof.empty() && constant_time_eq_str(client_proof, expected_proof)) {
                     std::string sess_hex;
+                    std::string cur_mode;
                     {
                         std::lock_guard<std::mutex> lock(net_mutex_);
                         sequence_ = 0; // Reset sequence per session
@@ -414,13 +476,22 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         paired_keys_[local_client_device_id] = session_key_;
                         SaveConfig();
                     }
+                    cur_mode = GetStreamMode();
 
                     std::ostringstream oss;
                     oss << "{\"type\":\"PAIR_OK\",\"session_id\":\"" << sess_hex << "\"}";
                     SendJson(client_sock, oss.str());
-                    SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2}");
 
-                    TriggerStartCapture();
+                    if (cur_mode == "microphone") {
+                        capture_.Stop();
+                        render_.Start(GetSelectedOutputDevice());
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":1,\"stream_mode\":\"microphone\"}");
+                    } else {
+                        render_.Stop();
+                        TriggerStartCapture();
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2,\"stream_mode\":\"speaker\"}");
+                    }
+
                     if (status_callback_) {
                         status_callback_("streaming", "Android 手机");
                     }
@@ -435,6 +506,7 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
 
                 bool success = false;
                 std::string sess_hex;
+                std::string cur_mode;
 
                 {
                     std::lock_guard<std::mutex> lock(net_mutex_);
@@ -458,17 +530,31 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                 }
 
                 if (success) {
+                    cur_mode = GetStreamMode();
                     std::ostringstream oss;
                     oss << "{\"type\":\"PAIR_OK\",\"session_id\":\"" << sess_hex << "\"}";
                     SendJson(client_sock, oss.str());
-                    SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2}");
 
-                    TriggerStartCapture();
+                    if (cur_mode == "microphone") {
+                        capture_.Stop();
+                        render_.Start(GetSelectedOutputDevice());
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":1,\"stream_mode\":\"microphone\"}");
+                    } else {
+                        render_.Stop();
+                        TriggerStartCapture();
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2,\"stream_mode\":\"speaker\"}");
+                    }
+
                     if (status_callback_) {
                         status_callback_("streaming", "Android 手机");
                     }
                 } else {
                     SendJson(client_sock, "{\"type\":\"PAIR_FAIL\",\"reason\":\"key_expired_or_not_found\"}");
+                }
+            } else if (type == "CAPABILITIES") {
+                std::string req_mode = ExtractJsonString(line, "stream_mode");
+                if (!req_mode.empty()) {
+                    SetStreamMode(req_mode);
                 }
             } else if (type == "PING") {
                 int64_t t = ExtractJsonInt64(line, "t", 0);
@@ -515,6 +601,86 @@ void WindowsAudioRelayServer::TcpAudioLoop() {
             }
             active_audio_tcp_sock_ = sock;
         }
+
+        std::thread([this, sock]() {
+            while (is_running_.load()) {
+                uint8_t len_buf[2];
+                int n = recv(sock, (char*)len_buf, 2, MSG_WAITALL);
+                if (n != 2) break;
+                uint16_t pkt_len = ((uint16_t)len_buf[0] << 8) | (uint16_t)len_buf[1];
+                std::vector<uint8_t> pkt(pkt_len);
+                int recvd = recv(sock, (char*)pkt.data(), pkt_len, MSG_WAITALL);
+                if (recvd != pkt_len) break;
+                if (GetStreamMode() == "microphone") {
+                    ProcessIncomingAudioPacket(pkt.data(), pkt.size());
+                }
+            }
+            closesocket(sock);
+        }).detach();
+    }
+}
+
+void WindowsAudioRelayServer::UdpAudioReceiveLoop() {
+    std::vector<uint8_t> buffer(4096);
+    sockaddr_in from_addr{};
+    int from_len = sizeof(from_addr);
+
+    while (is_running_.load()) {
+        int n = recvfrom(udp_sock_, (char*)buffer.data(), (int)buffer.size(), 0, (sockaddr*)&from_addr, &from_len);
+        if (n <= 0) {
+            if (!is_running_.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        if (GetStreamMode() == "microphone") {
+            ProcessIncomingAudioPacket(buffer.data(), (size_t)n);
+        }
+    }
+}
+
+void WindowsAudioRelayServer::ProcessIncomingAudioPacket(const uint8_t* data, size_t len) {
+    if (len < 13 + 16) return; // 13-byte header + 16-byte Poly1305 tag
+    if (data[0] != 0x00) return; // Raw PCM
+
+    std::vector<uint8_t> key;
+    std::vector<uint8_t> sess_id;
+    {
+        std::lock_guard<std::mutex> lock(net_mutex_);
+        if (session_key_.size() != 32 || session_id_.size() != 8) return;
+        key = session_key_;
+        sess_id = session_id_;
+    }
+
+    // Build nonce (12B): session_id (8B) + sequence (4B: data[1..4])
+    // Incoming packet is Phone -> Laptop (Microphone): set Direction Bit (bit 31 = 1)
+    uint8_t nonce[12];
+    std::memcpy(nonce, sess_id.data(), 8);
+    nonce[8] = data[1] | 0x80;
+    nonce[9] = data[2];
+    nonce[10] = data[3];
+    nonce[11] = data[4];
+
+    int sample_rate = (data[9] == 0) ? 44100 : 48000;
+    int channels = (int)data[10];
+    if (channels <= 0) channels = 1;
+
+    size_t ciphertext_len = len - 13 - 16;
+    const uint8_t* ciphertext = data + 13;
+    const uint8_t* tag = data + 13 + ciphertext_len;
+
+    std::vector<uint8_t> plaintext(ciphertext_len);
+    bool ok = chacha20_poly1305_open(
+        key.data(),
+        nonce,
+        data, 13, // header as AAD
+        ciphertext, ciphertext_len,
+        tag,
+        plaintext.data()
+    );
+
+    if (ok) {
+        render_.WritePcmChunk(plaintext.data(), plaintext.size(), channels, sample_rate);
     }
 }
 

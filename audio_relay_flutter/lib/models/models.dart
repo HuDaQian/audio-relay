@@ -1,5 +1,10 @@
 enum RelayRole { sender, receiver }
 
+enum RelayMode {
+  speaker,
+  microphone,
+}
+
 enum ConnectionStateType {
   idle,
   connecting,
@@ -72,3 +77,27 @@ class DiscoveredDevice {
     );
   }
 }
+
+class AudioOutputDevice {
+  final String id;
+  final String name;
+  final bool isDefault;
+  final bool isVirtual;
+
+  AudioOutputDevice({
+    required this.id,
+    required this.name,
+    required this.isDefault,
+    required this.isVirtual,
+  });
+
+  factory AudioOutputDevice.fromMap(Map<dynamic, dynamic> map) {
+    return AudioOutputDevice(
+      id: map['id'] as String? ?? '',
+      name: map['name'] as String? ?? 'Unknown Device',
+      isDefault: map['is_default'] as bool? ?? false,
+      isVirtual: map['is_virtual'] as bool? ?? false,
+    );
+  }
+}
+

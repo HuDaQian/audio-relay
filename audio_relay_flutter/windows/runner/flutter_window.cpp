@@ -77,6 +77,38 @@ bool FlutterWindow::OnCreate() {
         } else if (call.method_name() == "regenerateCode") {
           s.GenerateNewPairCode();
           result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "getOutputDevices") {
+          auto devList = s.GetOutputDevices();
+          flutter::EncodableList list;
+          for (const auto& d : devList) {
+            flutter::EncodableMap map;
+            map[flutter::EncodableValue("id")] = flutter::EncodableValue(d.id);
+            map[flutter::EncodableValue("name")] = flutter::EncodableValue(d.name);
+            map[flutter::EncodableValue("is_virtual")] = flutter::EncodableValue(d.is_virtual);
+            map[flutter::EncodableValue("is_default")] = flutter::EncodableValue(d.is_default);
+            list.push_back(flutter::EncodableValue(map));
+          }
+          result->Success(flutter::EncodableValue(list));
+        } else if (call.method_name() == "setOutputDevice") {
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("id"));
+            if (it != args->end() && std::holds_alternative<std::string>(it->second)) {
+              s.SetOutputDevice(std::get<std::string>(it->second));
+            }
+          }
+          result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "setStreamMode") {
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("mode"));
+            if (it != args->end() && std::holds_alternative<std::string>(it->second)) {
+              s.SetStreamMode(std::get<std::string>(it->second));
+            }
+          }
+          result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "getStreamMode") {
+          result->Success(flutter::EncodableValue(s.GetStreamMode()));
         } else {
           result->NotImplemented();
         }

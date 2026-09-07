@@ -92,12 +92,13 @@ class RelayPlatformService {
     }
   }
 
-  Future<void> connect(String host, int port) async {
+  Future<void> connect(String host, int port, {RelayMode mode = RelayMode.speaker}) async {
     if (!Platform.isAndroid) return;
     try {
       await _methodChannel.invokeMethod('connect', {
         'host': host,
         'port': port,
+        'mode': mode == RelayMode.microphone ? 'microphone' : 'speaker',
       });
     } catch (e) {
       debugPrint('connect error: $e');

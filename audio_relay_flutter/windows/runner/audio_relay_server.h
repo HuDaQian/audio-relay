@@ -12,6 +12,7 @@
 #include <atomic>
 #include <functional>
 #include "wasapi_capture.h"
+#include "wasapi_render.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -35,6 +36,12 @@ public:
     std::string GetDeviceName() const { return device_name_; }
     bool IsCapturing() const { return capture_.IsRunning(); }
 
+    std::vector<AudioOutputDeviceInfo> GetOutputDevices() { return WasapiRender::EnumerateOutputDevices(); }
+    void SetOutputDevice(const std::string& device_id);
+    std::string GetSelectedOutputDevice() const;
+    void SetStreamMode(const std::string& mode);
+    std::string GetStreamMode() const;
+
 private:
     WindowsAudioRelayServer();
     ~WindowsAudioRelayServer();
@@ -43,6 +50,8 @@ private:
     void TcpControlLoop();
     void HandleControlClient(SOCKET client_sock, sockaddr_in client_addr);
     void TcpAudioLoop();
+    void UdpAudioReceiveLoop();
+    void ProcessIncomingAudioPacket(const uint8_t* data, size_t len);
     void AdbSupervisorLoop();
     std::string FindAdbPath();
     void MdnsLoop();
@@ -59,6 +68,10 @@ private:
     std::string device_name_;
     std::string device_id_;
 
+    mutable std::mutex mode_mutex_;
+    std::string stream_mode_{"speaker"};
+    std::string selected_output_device_{""};
+
     std::vector<uint8_t> session_id_;
     std::vector<uint8_t> session_key_;
     std::map<std::string, std::vector<uint8_t>> paired_keys_;
@@ -66,11 +79,13 @@ private:
     uint32_t sequence_{0};
 
     WasapiCapture capture_;
+    WasapiRender render_;
     StatusCallback status_callback_;
 
     std::atomic<bool> is_running_{false};
     std::thread tcp_control_thread_;
     std::thread tcp_audio_thread_;
+    std::thread udp_audio_receive_thread_;
     std::thread adb_thread_;
     std::thread mdns_thread_;
 

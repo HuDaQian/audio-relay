@@ -23,6 +23,10 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _hasAudioPermission = true;
   Timer? _permissionTimer;
 
+  RelayMode _currentMode = RelayMode.speaker;
+  List<AudioOutputDevice> _desktopOutputDevices = [];
+  String? _selectedOutputDeviceId;
+
   @override
   void initState() {
     super.initState();
@@ -43,12 +47,16 @@ class _HomeScreenState extends State<HomeScreen> {
         if (mounted) {
           setState(() {
             if (status == 'streaming') {
-              _desktopStatus = '正在向 ${client ?? "手机"} 串流音频';
+              _desktopStatus = _currentMode == RelayMode.microphone
+                  ? '正在接收 ${client ?? "手机"} 的麦克风输入'
+                  : '正在向 ${client ?? "手机"} 串流音频';
               _desktopConnectedClient = client;
             } else if (status == 'pairing') {
               _desktopStatus = '正在与 ${client ?? "手机"} 配对握手...';
             } else {
-              _desktopStatus = '音频广播服务运行中 (等待设备连接)';
+              _desktopStatus = _currentMode == RelayMode.microphone
+                  ? '麦克风接收服务运行中 (等待设备连接)'
+                  : '音频广播服务运行中 (等待设备连接)';
               _desktopConnectedClient = null;
             }
           });
@@ -61,10 +69,13 @@ class _HomeScreenState extends State<HomeScreen> {
       if (info != null && mounted) {
         setState(() {
           _desktopPairCode = info['pairCode'] as String? ?? '123456';
-          _desktopStatus = '音频广播服务运行中 (等待设备连接)';
+          _desktopStatus = _currentMode == RelayMode.microphone
+              ? '麦克风接收服务运行中 (等待设备连接)'
+              : '音频广播服务运行中 (等待设备连接)';
           _hasAudioPermission = info['hasPermission'] as bool? ?? true;
         });
       }
+      await _fetchDesktopDevices();
     } catch (e) {
       debugPrint('Desktop channel error: $e');
     }
@@ -90,6 +101,56 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       } catch (_) {}
     });
+  }
+
+  Future<void> _fetchDesktopDevices() async {
+    try {
+      final res = await _desktopChannel.invokeMethod<List>('getOutputDevices');
+      if (res != null && mounted) {
+        final devs = res.map((e) => AudioOutputDevice.fromMap(Map<dynamic, dynamic>.from(e as Map))).toList();
+        setState(() {
+          _desktopOutputDevices = devs;
+          if (_selectedOutputDeviceId == null) {
+            final virt = devs.where((d) => d.isVirtual).firstOrNull;
+            final def = devs.where((d) => d.isDefault).firstOrNull;
+            _selectedOutputDeviceId = virt?.id ?? def?.id ?? devs.firstOrNull?.id;
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('getOutputDevices error: $e');
+    }
+  }
+
+  Future<void> _setDesktopMode(RelayMode mode) async {
+    setState(() {
+      _currentMode = mode;
+      _desktopStatus = mode == RelayMode.microphone
+          ? '麦克风接收服务运行中 (等待设备连接)'
+          : '音频广播服务运行中 (等待设备连接)';
+    });
+    try {
+      await _desktopChannel.invokeMethod('setStreamMode', {
+        'mode': mode == RelayMode.microphone ? 'microphone' : 'speaker',
+      });
+      if (mode == RelayMode.microphone) {
+        await _fetchDesktopDevices();
+      }
+    } catch (e) {
+      debugPrint('setStreamMode error: $e');
+    }
+  }
+
+  Future<void> _onOutputDeviceSelected(String? id) async {
+    if (id == null) return;
+    setState(() {
+      _selectedOutputDeviceId = id;
+    });
+    try {
+      await _desktopChannel.invokeMethod('setOutputDevice', {'id': id});
+    } catch (e) {
+      debugPrint('setOutputDevice error: $e');
+    }
   }
 
   Future<void> _regenerateDesktopPairCode() async {
@@ -191,7 +252,13 @@ class _HomeScreenState extends State<HomeScreen> {
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: '刷新有线与网络状态',
-            onPressed: () => _service.checkWiredNetwork(),
+            onPressed: () {
+              if (isDesktop) {
+                _fetchDesktopDevices();
+              } else {
+                _service.checkWiredNetwork();
+              }
+            },
           ),
         ],
       ),
@@ -201,41 +268,71 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // --- Mobile Receiver UI ---
   Widget _buildMobileReceiverView() {
-    return ValueListenableBuilder<ConnectionStatus>(
-      valueListenable: _service.statusNotifier,
-      builder: (context, status, _) {
-        if (status.type == ConnectionStateType.streaming) {
-          return _buildStreamingView(status);
-        } else if (status.type == ConnectionStateType.connecting) {
-          return _buildConnectingView(status);
-        }
-        return _buildDiscoveryView();
-      },
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+          child: SegmentedButton<RelayMode>(
+            segments: const [
+              ButtonSegment<RelayMode>(
+                value: RelayMode.speaker,
+                icon: Icon(Icons.headphones_rounded),
+                label: Text('扬声器模式'),
+              ),
+              ButtonSegment<RelayMode>(
+                value: RelayMode.microphone,
+                icon: Icon(Icons.mic_rounded),
+                label: Text('麦克风模式'),
+              ),
+            ],
+            selected: {_currentMode},
+            onSelectionChanged: (newSelection) {
+              setState(() {
+                _currentMode = newSelection.first;
+              });
+            },
+          ),
+        ),
+        Expanded(
+          child: ValueListenableBuilder<ConnectionStatus>(
+            valueListenable: _service.statusNotifier,
+            builder: (context, status, _) {
+              if (status.type == ConnectionStateType.streaming) {
+                return _buildStreamingView(status);
+              } else if (status.type == ConnectionStateType.connecting) {
+                return _buildConnectingView(status);
+              }
+              return _buildDiscoveryView();
+            },
+          ),
+        ),
+      ],
     );
   }
 
   Widget _buildStreamingView(ConnectionStatus status) {
+    final isMic = _currentMode == RelayMode.microphone;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24.0),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(
-              Icons.headphones_rounded,
+            Icon(
+              isMic ? Icons.mic_rounded : Icons.headphones_rounded,
               size: 72,
               color: Colors.green,
             ),
             const SizedBox(height: 16),
             Text(
-              '正在接收音频',
+              isMic ? '正在传输麦克风音频' : '正在接收音频',
               style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                     fontWeight: FontWeight.bold,
                   ),
             ),
             const SizedBox(height: 8),
             Text(
-              '来源：${status.deviceName ?? "电脑"}',
+              isMic ? '目标：${status.deviceName ?? "电脑"}' : '来源：${status.deviceName ?? "电脑"}',
               style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                     color: Colors.grey[700],
                   ),
@@ -324,7 +421,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       const SizedBox(width: 12),
                       Expanded(
                         child: Text(
-                          'iOS 暂不支持音频接收功能。目前移动端仅支持 Android 设备的低延迟 AudioTrack 播放。',
+                          'iOS 暂不支持音频串流功能。目前移动端仅支持 Android 设备。',
                           style: TextStyle(color: Colors.amber.shade900, fontSize: 13),
                         ),
                       ),
@@ -334,6 +431,47 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 12),
             ],
+            if (_currentMode == RelayMode.microphone)
+              Card(
+                color: Colors.indigo.shade50,
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: BorderSide(color: Colors.indigo.shade200),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.mic_external_on_rounded, color: Colors.indigo.shade700),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '已开启麦克风模式：手机麦克风输入实时加密传输给电脑。',
+                              style: TextStyle(color: Colors.indigo.shade900, fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '🎧 防回声建议：在单向麦克风通话时，建议电脑端佩戴耳机收听会议声音，避免电脑外放音箱被手机二次拾音产生远端回声。',
+                              style: TextStyle(color: Colors.indigo.shade800, fontSize: 12),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '🔌 驱动说明：本软件本身为绿色免安装客户端，但需系统预装一次虚拟声卡 (如 VB-CABLE / BlackHole) 供第三方会议软件接入。',
+                              style: TextStyle(color: Colors.indigo.shade800, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            if (_currentMode == RelayMode.microphone) const SizedBox(height: 12),
             // USB Tethering Banner (Option 1)
             Card(
               color: hasUsbTether
@@ -395,7 +533,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             valueListenable: _service.suggestedUsbHostNotifier,
                             builder: (context, host, _) {
                               return FilledButton.icon(
-                                onPressed: () => _service.connect(host, 45108),
+                                onPressed: () => _service.connect(host, 45108, mode: _currentMode),
                                 icon: const Icon(Icons.flash_on_rounded, size: 18),
                                 label: Text('USB 极速连接 ($host)'),
                                 style: FilledButton.styleFrom(
@@ -405,7 +543,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             },
                           ),
                         OutlinedButton.icon(
-                          onPressed: () => _service.connect('127.0.0.1', 45108),
+                          onPressed: () => _service.connect('127.0.0.1', 45108, mode: _currentMode),
                           icon: const Icon(Icons.usb_rounded, size: 18),
                           label: const Text('ADB 端口直连 (127.0.0.1)'),
                         ),
@@ -461,7 +599,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                         subtitle: Text('${dev.host}:${dev.port} ${dev.paired ? "• 已配对" : ""}'),
                         trailing: FilledButton.tonal(
-                          onPressed: () => _service.connect(dev.host, dev.port),
+                          onPressed: () => _service.connect(dev.host, dev.port, mode: _currentMode),
                           child: const Text('连接'),
                         ),
                       ),
@@ -476,12 +614,14 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // --- Desktop Sender UI ---
+  // --- Desktop UI ---
   Widget _buildDesktopSenderView() {
+    final hasVirtual = _desktopOutputDevices.any((d) => d.isVirtual);
+
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 540),
-        child: Padding(
+        constraints: const BoxConstraints(maxWidth: 580),
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Card(
             elevation: 2,
@@ -492,6 +632,29 @@ class _HomeScreenState extends State<HomeScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Mode Selection
+                  Center(
+                    child: SegmentedButton<RelayMode>(
+                      segments: const [
+                        ButtonSegment<RelayMode>(
+                          value: RelayMode.speaker,
+                          icon: Icon(Icons.headphones_rounded),
+                          label: Text('电脑扬声器中继 (发送)'),
+                        ),
+                        ButtonSegment<RelayMode>(
+                          value: RelayMode.microphone,
+                          icon: Icon(Icons.mic_rounded),
+                          label: Text('手机做麦克风 (接收)'),
+                        ),
+                      ],
+                      selected: {_currentMode},
+                      onSelectionChanged: (newSelection) {
+                        _setDesktopMode(newSelection.first);
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+
                   Row(
                     children: [
                       Container(
@@ -512,48 +675,121 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                   const SizedBox(height: 16),
-                  const Text('音频中继端口：45108 (TCP 控制 / UDP 音频)'),
-                  const Text('捕获后端：ScreenCaptureKit (macOS) / WASAPI (Windows)'),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      if (_hasAudioPermission)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: Colors.green.shade50,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.green.shade300),
+                  const Text('音频中继端口：45108 (TCP 控制 / UDP 音频) | 45109 (TCP 串流)'),
+
+                  if (_currentMode == RelayMode.speaker) ...[
+                    const Text('捕获后端：ScreenCaptureKit (macOS) / WASAPI (Windows)'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        if (_hasAudioPermission)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.green.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.green.shade300),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.check_circle_rounded, color: Colors.green.shade700, size: 16),
+                                const SizedBox(width: 6),
+                                Text(
+                                  '系统音频捕获：正在运行',
+                                  style: TextStyle(fontSize: 13, color: Colors.green.shade900, fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                          )
+                        else ...[
+                          FilledButton.tonalIcon(
+                            onPressed: () => _desktopChannel.invokeMethod('startCapture'),
+                            icon: const Icon(Icons.play_circle_outline_rounded, size: 18),
+                            label: const Text('启动系统内录'),
                           ),
+                          OutlinedButton.icon(
+                            onPressed: () => _desktopChannel.invokeMethod('openPermissionSettings'),
+                            icon: const Icon(Icons.settings_suggest_rounded, size: 18),
+                            label: const Text('系统设置授权'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ] else ...[
+                    const SizedBox(height: 8),
+                    // Virtual device selector
+                    Text(
+                      '麦克风音频输出设备 (推荐虚拟声卡)：',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButton<String>(
+                      value: _desktopOutputDevices.any((d) => d.id == _selectedOutputDeviceId)
+                          ? _selectedOutputDeviceId
+                          : null,
+                      isExpanded: true,
+                      underline: Container(
+                        height: 1,
+                        color: Colors.grey.shade400,
+                      ),
+                      items: _desktopOutputDevices.map((dev) {
+                        return DropdownMenuItem<String>(
+                          value: dev.id,
                           child: Row(
-                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              Icon(Icons.check_circle_rounded, color: Colors.green.shade700, size: 16),
-                              const SizedBox(width: 6),
-                              Text(
-                                '系统音频捕获：正在运行',
-                                style: TextStyle(fontSize: 13, color: Colors.green.shade900, fontWeight: FontWeight.bold),
+                              Icon(
+                                dev.isVirtual ? Icons.cable_rounded : Icons.speaker_rounded,
+                                size: 18,
+                                color: dev.isVirtual ? Colors.green : Colors.grey,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  dev.name + (dev.isVirtual ? ' (虚拟声卡 - 推荐)' : (dev.isDefault ? ' (系统默认)' : '')),
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontWeight: dev.isVirtual ? FontWeight.bold : FontWeight.normal,
+                                    color: dev.isVirtual ? Colors.green.shade900 : Colors.black87,
+                                  ),
+                                ),
                               ),
                             ],
                           ),
-                        )
-                      else ...[
-                        FilledButton.tonalIcon(
-                          onPressed: () => _desktopChannel.invokeMethod('startCapture'),
-                          icon: const Icon(Icons.play_circle_outline_rounded, size: 18),
-                          label: const Text('启动系统内录'),
+                        );
+                      }).toList(),
+                      onChanged: _onOutputDeviceSelected,
+                    ),
+                    if (!hasVirtual) ...[
+                      const SizedBox(height: 10),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.amber.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.amber.shade300),
                         ),
-                        OutlinedButton.icon(
-                          onPressed: () => _desktopChannel.invokeMethod('openPermissionSettings'),
-                          icon: const Icon(Icons.settings_suggest_rounded, size: 18),
-                          label: const Text('系统设置授权'),
+                        child: Row(
+                          children: [
+                            Icon(Icons.warning_amber_rounded, color: Colors.amber.shade900),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                Platform.isWindows
+                                    ? '提示：未检测到虚拟音频设备！请安装 VB-CABLE，会议软件 (如 Zoom/腾讯会议) 麦克风选择 "CABLE Output" 即可拾取手机声音。'
+                                    : '提示：未检测到虚拟音频设备！推荐安装 BlackHole (2ch)，会议软件选择 "BlackHole 2ch" 即可拾取手机麦克风声音。',
+                                style: TextStyle(fontSize: 12, color: Colors.amber.shade900),
+                              ),
+                            ),
+                          ],
                         ),
-                      ],
+                      ),
                     ],
-                  ),
+                  ],
+
                   const Divider(height: 32),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,

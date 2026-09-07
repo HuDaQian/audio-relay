@@ -19,14 +19,17 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.audiorelay.flutter.audio_relay_flutter.MainActivity
+import com.audiorelay.flutter.audio_relay_flutter.audio.AudioRecorder
 import com.audiorelay.flutter.audio_relay_flutter.audio.OutputDeviceRepository
 import com.audiorelay.flutter.audio_relay_flutter.discovery.NsdDiscovery
 import java.net.Socket
 import java.net.InetSocketAddress
+import java.net.InetAddress
 import com.audiorelay.flutter.audio_relay_flutter.network.AudioReceiver
 import com.audiorelay.flutter.audio_relay_flutter.network.ControlChannel
 import com.audiorelay.flutter.audio_relay_flutter.network.ControlMessage
 import com.audiorelay.flutter.audio_relay_flutter.network.Crypto
+import com.audiorelay.flutter.audio_relay_flutter.network.MicAudioSender
 import com.audiorelay.flutter.audio_relay_flutter.state.ConnectionStatus
 import com.audiorelay.flutter.audio_relay_flutter.state.DiscoveredLaptop
 import com.audiorelay.flutter.audio_relay_flutter.state.PairedDeviceStore
@@ -44,6 +47,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Foreground service ("mediaPlayback" type) that owns the whole
@@ -97,6 +101,9 @@ class RelayService : Service() {
 
     /** The receiver for the currently active session, if any — lets Settings changes (output device) apply live, without a reconnect. */
     @Volatile private var activeReceiver: AudioReceiver? = null
+    @Volatile private var activeRecorder: AudioRecorder? = null
+    @Volatile private var activeMicSender: MicAudioSender? = null
+    @Volatile private var currentStreamMode: String = "speaker"
 
     // --- reconnect supervision (docs/roadmap.md Phase 4) ---
 
@@ -164,20 +171,15 @@ class RelayService : Service() {
                 val name = intent.getStringExtra(EXTRA_NAME) ?: "电脑"
                 val host = intent.getStringExtra(EXTRA_HOST)
                 val port = intent.getIntExtra(EXTRA_PORT, -1)
+                val streamMode = intent.getStringExtra(EXTRA_STREAM_MODE) ?: "speaker"
+                currentStreamMode = streamMode
                 if (host != null && port > 0) {
                     reconnectJob?.cancel()
                     reconnectAttempt = 0
                     val target = DiscoveredLaptop(deviceId, name, host, port)
-                    // ...nor behind an attempt that is already in flight.
-                    // `connectTo` refuses to start while one is active, so a
-                    // tap on Connect used to do nothing at all whenever an
-                    // automatic attempt was mid-retry — the user saw it
-                    // "connect by itself and keep retrying" instead of being
-                    // asked for a code. Tearing the in-flight one down first
-                    // makes the tap authoritative.
                     serviceScope.launch {
                         cancelActiveSession()
-                        connectTo(target)
+                        connectTo(target, streamMode)
                     }
                 }
             }
@@ -354,6 +356,10 @@ class RelayService : Service() {
             // nothing. Closing here releases the track and the socket, which
             // is what actually unblocks both loops so the join can complete.
             activeReceiver?.close()
+            activeRecorder?.stop()
+            activeRecorder = null
+            activeMicSender?.close()
+            activeMicSender = null
             connectJob?.cancelAndJoin()
             connectJob = null
         } finally {
@@ -470,6 +476,7 @@ class RelayService : Service() {
         channel: ControlChannel,
         laptop: DiscoveredLaptop,
         ack: ControlMessage.HelloAck,
+        streamMode: String = "speaker",
     ): ControlChannel.Paired {
         var lastRejection: String? = null
         // The laptop allows a bounded number of attempts per connection;
@@ -482,7 +489,7 @@ class RelayService : Service() {
             pendingPairingCode = deferred
             val code = deferred.await()
             try {
-                val paired = channel.pairWithCode(code, ack.nonce, ack.device_id, ack.device_name)
+                val paired = channel.pairWithCode(code, ack.nonce, ack.device_id, ack.device_name, streamMode)
                 RelayState.setPairingError(null)
                 return paired
             } catch (e: ControlChannel.PairingRejected) {
@@ -495,86 +502,138 @@ class RelayService : Service() {
     }
 
     /** Also called directly by the UI when the user picks a device from the list. */
-    fun connectTo(laptop: DiscoveredLaptop) {
+    fun connectTo(laptop: DiscoveredLaptop, streamMode: String = currentStreamMode) {
         lastTarget = laptop
+        currentStreamMode = streamMode
         reconnectJob?.cancel()
         val oldJob = connectJob
         connectJob = serviceScope.launch {
             oldJob?.cancelAndJoin()
             RelayState.setStatus(ConnectionStatus.CONNECTING)
             var receiver: AudioReceiver? = null
+            var recorder: AudioRecorder? = null
+            var micSender: MicAudioSender? = null
             var channel: ControlChannel? = null
             var audioTcpSocket: Socket? = null
             try {
-                val sessionReceiver = AudioReceiver().also {
-                    receiver = it
-                    activeReceiver = it
-                }
+                val sessionReceiver = if (streamMode != "microphone") {
+                    AudioReceiver().also {
+                        receiver = it
+                        activeReceiver = it
+                    }
+                } else null
+
                 val activeChannel = ControlChannel(
                     host = laptop.host,
                     port = laptop.port,
                     deviceId = store.deviceId,
                     deviceName = Build.MODEL ?: "Android device",
-                    audioPort = sessionReceiver.localPort,
+                    audioPort = sessionReceiver?.localPort ?: 45108,
                 ).also { channel = it }
 
-                val ack = activeChannel.connect()
+                val ack = activeChannel.connect(streamMode)
                 val savedLaptop = if (ack.paired) store.getSavedLaptop(ack.device_id) else null
                 val paired = if (savedLaptop != null) {
                     try {
-                        activeChannel.repair(ack.device_id, ack.device_name, Crypto.hexToBytes(savedLaptop.sessionKeyHex), ack.nonce)
+                        activeChannel.repair(ack.device_id, ack.device_name, Crypto.hexToBytes(savedLaptop.sessionKeyHex), ack.nonce, streamMode)
                     } catch (e: ControlChannel.PairingRejected) {
                         Log.w(TAG, "stored key rejected (${e.message}); pairing again", e)
                         store.forgetLaptop(ack.device_id)
                         refreshPairedLaptops()
-                        pairInteractively(activeChannel, laptop, ack)
+                        pairInteractively(activeChannel, laptop, ack, streamMode)
                     }
                 } else {
-                    pairInteractively(activeChannel, laptop, ack)
+                    pairInteractively(activeChannel, laptop, ack, streamMode)
                 }
                 pendingPairingCode = null
                 RelayState.setPendingPairingTarget(null)
                 store.saveLaptop(paired.laptopDeviceId, paired.laptopDeviceName, Crypto.toHex(paired.sessionKey))
                 refreshPairedLaptops()
 
-                val preferredDevice = settings.preferredOutputDeviceKey?.let { outputDevices.findByKey(it) }
-                sessionReceiver.configureSession(
-                    sessionKey = paired.sessionKey,
-                    sessionId = paired.sessionId,
-                    sampleRateHz = paired.sampleRateHz,
-                    channels = paired.channels,
-                    jitterTargetDepthMs = settings.jitterTargetDepthMs,
-                    preferredOutputDevice = preferredDevice,
-                )
                 RelayState.setStatus(ConnectionStatus.STREAMING)
                 RelayState.setConnectedDeviceName(paired.laptopDeviceName)
                 updateNotification(paired.laptopDeviceName)
                 reconnectAttempt = 0
 
-                if (laptop.host == "127.0.0.1") {
-                    try {
-                        val s = Socket()
-                        s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
-                        s.tcpNoDelay = true
-                        audioTcpSocket = s
-                        launch { sessionReceiver.receiveTcpLoop(s.getInputStream()) }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "TCP audio connect failed: ${e.message}, falling back to UDP", e)
-                        launch { sessionReceiver.receiveLoop() }
+                if (streamMode == "microphone") {
+                    val targetAddr = withContext(Dispatchers.IO) { InetAddress.getByName(laptop.host) }
+                    var tcpOut: java.io.OutputStream? = null
+                    if (laptop.host == "127.0.0.1") {
+                        try {
+                            val s = Socket()
+                            s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
+                            s.tcpNoDelay = true
+                            audioTcpSocket = s
+                            tcpOut = s.getOutputStream()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "TCP mic socket connect failed, fallback to UDP", e)
+                        }
                     }
+
+                    val sender = MicAudioSender(
+                        sessionKey = paired.sessionKey,
+                        sessionId = paired.sessionId,
+                        targetAddress = targetAddr,
+                        targetUdpPort = 45108,
+                        tcpOutputStream = tcpOut,
+                        sampleRateHz = paired.sampleRateHz,
+                        channels = paired.channels,
+                    ).also {
+                        micSender = it
+                        activeMicSender = it
+                    }
+
+                    val rec = AudioRecorder(
+                        sampleRate = paired.sampleRateHz,
+                        channels = paired.channels,
+                        onPcmChunk = { pcm, len -> sender.sendChunk(pcm, len) },
+                        onAudioLevel = { level -> RelayState.setPlaybackLevel(level) },
+                    ).also {
+                        recorder = it
+                        activeRecorder = it
+                    }
+                    rec.start(serviceScope)
+                    activeChannel.heartbeatLoop()
                 } else {
-                    launch { sessionReceiver.receiveLoop() }
+                    val preferredDevice = settings.preferredOutputDeviceKey?.let { outputDevices.findByKey(it) }
+                    sessionReceiver?.configureSession(
+                        sessionKey = paired.sessionKey,
+                        sessionId = paired.sessionId,
+                        sampleRateHz = paired.sampleRateHz,
+                        channels = paired.channels,
+                        jitterTargetDepthMs = settings.jitterTargetDepthMs,
+                        preferredOutputDevice = preferredDevice,
+                    )
+
+                    if (laptop.host == "127.0.0.1") {
+                        try {
+                            val s = Socket()
+                            s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
+                            s.tcpNoDelay = true
+                            audioTcpSocket = s
+                            launch { sessionReceiver?.receiveTcpLoop(s.getInputStream()) }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "TCP audio connect failed: ${e.message}, falling back to UDP", e)
+                            launch { sessionReceiver?.receiveLoop() }
+                        }
+                    } else {
+                        launch { sessionReceiver?.receiveLoop() }
+                    }
+                    launch { sessionReceiver?.playbackLoop() }
+                    activeChannel.heartbeatLoop()
                 }
-                launch { sessionReceiver.playbackLoop() }
-                activeChannel.heartbeatLoop()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "connection to ${laptop.name} ended: ${e.message}", e)
             } finally {
                 audioTcpSocket?.close()
+                recorder?.stop()
+                micSender?.close()
                 receiver?.close()
                 channel?.close()
+                activeRecorder = null
+                activeMicSender = null
                 activeReceiver = null
                 RelayState.setPlaybackLevel(0f)
                 pendingPairingCode = null
@@ -682,5 +741,6 @@ class RelayService : Service() {
         const val EXTRA_JITTER_DEPTH = "jitter_depth_ms"
         const val EXTRA_THEME_MODE = "theme_mode"
         const val EXTRA_DYNAMIC_COLOR = "dynamic_color"
+        const val EXTRA_STREAM_MODE = "stream_mode"
     }
 }
