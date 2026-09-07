@@ -222,6 +222,121 @@ class MacAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
 // MARK: - MacAudioPlayer (AudioQueue for virtual audio output)
 
+// Sequence-aware jitter buffer for the microphone receive path. Operates on
+// mono int16 PCM frames and mirrors the Windows `JitterBuffer` semantics:
+// reorder, pre-buffer, conceal gaps, shed backlog, and recover from desync.
+final class MacJitterBuffer {
+    private let lock = NSLock()
+    private var chunks: [UInt32: [Int16]] = [:]
+    private var nextSeq: UInt32 = 0
+    private var started = false
+    private var chunkFrames = 0
+    private var chunkPos = 0
+    private var concealCount: UInt32 = 0
+    private let targetDepth: Int
+
+    init(targetDepth: Int = 3) {
+        self.targetDepth = max(1, targetDepth)
+    }
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        resetLocked()
+    }
+
+    func push(sequence: UInt32, frames: [Int16]) {
+        guard !frames.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+
+        if started {
+            let dist = Int64(sequence) - Int64(nextSeq)
+            if dist < -200 || dist > 200 {
+                resetLocked()
+            } else if dist < 0 {
+                return  // late or duplicate
+            }
+        }
+
+        guard chunks[sequence] == nil else { return }  // duplicate
+        if chunks.count >= 64 {
+            chunks.removeValue(forKey: chunks.keys.min()!)
+        }
+        if chunkFrames == 0 {
+            chunkFrames = frames.count
+        }
+        chunks[sequence] = frames
+    }
+
+    func pop(maxFrames: Int) -> [Int16] {
+        lock.lock(); defer { lock.unlock() }
+
+        if !started {
+            if chunks.count < targetDepth { return [] }
+            started = true
+            nextSeq = chunks.keys.min()!
+            chunkPos = 0
+            concealCount = 0
+            if chunkFrames == 0, let first = chunks.values.first {
+                chunkFrames = first.count
+            }
+        }
+
+        var out: [Int16] = []
+        out.reserveCapacity(maxFrames)
+
+        while out.count < maxFrames {
+            // Shed standing backlog before it becomes permanent latency.
+            if chunkPos == 0 && chunks.count > targetDepth * 2 {
+                while chunks.count > targetDepth {
+                    chunks.removeValue(forKey: chunks.keys.min()!)
+                }
+                if !chunks.isEmpty { nextSeq = chunks.keys.min()! }
+                chunkPos = 0
+                concealCount = 0
+            }
+
+            if let chunk = chunks[nextSeq] {
+                let remaining = chunk.count - chunkPos
+                let n = min(remaining, maxFrames - out.count)
+                out.append(contentsOf: chunk[chunkPos..<(chunkPos + n)])
+                chunkPos += n
+                if chunkPos >= chunk.count {
+                    chunks.removeValue(forKey: nextSeq)
+                    nextSeq &+= 1
+                    chunkPos = 0
+                    concealCount = 0
+                }
+            } else {
+                // Conceal a missing packet with exactly one packet of silence.
+                let concealLen = chunkFrames == 0 ? 480 : chunkFrames
+                let remaining = concealLen - chunkPos
+                let n = min(remaining, maxFrames - out.count)
+                out.append(contentsOf: repeatElement(Int16(0), count: n))
+                chunkPos += n
+                if chunkPos >= concealLen {
+                    nextSeq &+= 1
+                    chunkPos = 0
+                    concealCount += 1
+                    if concealCount > 50 {
+                        resetLocked()
+                        return out
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    private func resetLocked() {
+        chunks.removeAll()
+        nextSeq = 0
+        started = false
+        chunkFrames = 0
+        chunkPos = 0
+        concealCount = 0
+    }
+}
+
 class MacAudioPlayer {
     private var queue: AudioQueueRef?
     private(set) var isRunning: Bool = false
@@ -231,6 +346,10 @@ class MacAudioPlayer {
     private let bufferByteSize: UInt32 = 4096
     private var freeBuffers: [AudioQueueBufferRef] = []
     private let bufferLock = NSLock()
+
+    private let jitter = MacJitterBuffer(targetDepth: 3)
+    private let pumpQueue = DispatchQueue(label: "com.audiorelay.mac.player")
+    private var pumpTimer: DispatchSourceTimer?
 
     func start(deviceUID: String? = nil) {
         stop()
@@ -267,6 +386,7 @@ class MacAudioPlayer {
         }
 
         // Pre-allocate buffer pool to eliminate heap allocations on the audio hot-path
+        jitter.reset()
         bufferLock.lock()
         freeBuffers.removeAll()
         for _ in 0..<bufferCount {
@@ -279,6 +399,14 @@ class MacAudioPlayer {
 
         AudioQueueStart(q, nil)
         isRunning = true
+
+        let timer = DispatchSource.makeTimerSource(queue: pumpQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10))
+        timer.setEventHandler { [weak self] in
+            self?.pump()
+        }
+        timer.resume()
+        pumpTimer = timer
     }
 
     fileprivate func recycleBuffer(_ buffer: AudioQueueBufferRef) {
@@ -288,6 +416,8 @@ class MacAudioPlayer {
     }
 
     func stop() {
+        pumpTimer?.cancel()
+        pumpTimer = nil
         isRunning = false
         if let q = queue {
             AudioQueueStop(q, true)
@@ -299,38 +429,41 @@ class MacAudioPlayer {
         bufferLock.unlock()
     }
 
-    func writePcm(_ pcm: Data, channels: Int = 1) {
-        guard let q = queue, isRunning, !pcm.isEmpty else { return }
+    func pushPcm(_ sequence: UInt32, mono: [Int16]) {
+        jitter.push(sequence: sequence, frames: mono)
+    }
 
-        // If input is mono 16-bit, duplicate samples into stereo (L=R) for BlackHole 2ch compatibility
-        var stereoData: Data
-        if channels == 1 {
-            stereoData = Data(count: pcm.count * 2)
-            let inCount = pcm.count / 2
-            pcm.withUnsafeBytes { inRaw in
-                let inPtr = inRaw.bindMemory(to: Int16.self)
-                stereoData.withUnsafeMutableBytes { outRaw in
-                    let outPtr = outRaw.bindMemory(to: Int16.self)
-                    for i in 0..<inCount {
-                        outPtr[i * 2] = inPtr[i]
-                        outPtr[i * 2 + 1] = inPtr[i]
-                    }
-                }
-            }
-        } else {
-            stereoData = pcm
-        }
+    private func pump() {
+        guard let q = queue, isRunning else { return }
 
         bufferLock.lock()
-        let availableBuf = freeBuffers.popLast()
+        let buf = freeBuffers.popLast()
         bufferLock.unlock()
+        guard let buf = buf else { return }
 
-        if let buf = availableBuf {
-            let copyLen = min(Int(bufferByteSize), stereoData.count)
-            stereoData.copyBytes(to: buf.pointee.mAudioData.assumingMemoryBound(to: UInt8.self), count: copyLen)
-            buf.pointee.mAudioDataByteSize = UInt32(copyLen)
-            AudioQueueEnqueueBuffer(q, buf, 0, nil)
+        // One AudioQueue buffer holds 4096 bytes == 1024 stereo frames == 1024
+        // mono samples. Pop up to that many mono frames from the jitter buffer.
+        let maxFrames = Int(bufferByteSize) / 4
+        let mono = jitter.pop(maxFrames: maxFrames)
+        if mono.isEmpty {
+            bufferLock.lock()
+            freeBuffers.append(buf)
+            bufferLock.unlock()
+            return
         }
+
+        // Duplicate mono -> stereo (L=R) for BlackHole 2ch compatibility.
+        var stereo = [Int16](repeating: 0, count: mono.count * 2)
+        for i in 0..<mono.count {
+            stereo[i * 2] = mono[i]
+            stereo[i * 2 + 1] = mono[i]
+        }
+        let byteCount = stereo.count * MemoryLayout<Int16>.size
+        stereo.withUnsafeBytes { raw in
+            buf.pointee.mAudioData.copyMemory(from: raw.baseAddress!, byteCount: byteCount)
+        }
+        buf.pointee.mAudioDataByteSize = UInt32(byteCount)
+        AudioQueueEnqueueBuffer(q, buf, 0, nil)
     }
 }
 
@@ -686,8 +819,10 @@ class MacAudioRelayServer {
         stateLock.unlock()
 
         let seqBE = header.subdata(in: 1..<5)
+        let sequence = seqBE.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+
         var nonceData = Data(sessId)
-        var seqVal = seqBE.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        var seqVal = sequence
         // Incoming packet is Phone -> Laptop (Microphone): set Direction Bit (bit 31 = 1)
         seqVal |= 0x80000000
         var dirSeqBE = seqVal.bigEndian
@@ -708,8 +843,12 @@ class MacAudioRelayServer {
         }
 
         if streamMode == "microphone" {
-            let channels = Int(header[10])
-            player.writePcm(decrypted, channels: channels > 0 ? channels : 1)
+            // The Android microphone sender always transmits mono 16-bit PCM.
+            let samples = decrypted.withUnsafeBytes { raw -> [Int16] in
+                let p = raw.bindMemory(to: Int16.self)
+                return Array(UnsafeBufferPointer(start: p, count: raw.count / 2))
+            }
+            player.pushPcm(sequence, mono: samples)
         }
     }
 

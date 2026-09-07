@@ -7,8 +7,8 @@
 #include <vector>
 #include <thread>
 #include <atomic>
-#include <mutex>
-#include <condition_variable>
+
+#include "jitter_buffer.h"
 
 namespace audio_relay {
 
@@ -30,8 +30,10 @@ public:
     void Stop();
     bool IsRunning() const { return is_running_.load(); }
 
-    // Enqueues 16-bit PCM chunk from network receiver to be rendered to audio output
-    void WritePcmChunk(const uint8_t* pcm, size_t size, int channels = 1, int sample_rate = 48000);
+    // Enqueues one decoded 16-bit PCM packet to be rendered to audio output.
+    // Downmix/resample is applied here (where the device mix format is known),
+    // then the resulting mono frames are pushed into the jitter buffer.
+    void WritePcmChunk(uint32_t sequence, const uint8_t* pcm, size_t size, int channels = 1, int sample_rate = 48000);
 
 private:
     void RenderLoop(std::string device_id);
@@ -41,9 +43,7 @@ private:
     std::thread worker_thread_;
     HANDLE stop_event_{nullptr};
 
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::vector<int16_t> sample_queue_;
+    JitterBuffer jitter_;
 
     IMMDeviceEnumerator* enumerator_{nullptr};
     IMMDevice* device_{nullptr};

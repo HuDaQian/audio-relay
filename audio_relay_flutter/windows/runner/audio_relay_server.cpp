@@ -661,6 +661,9 @@ void WindowsAudioRelayServer::ProcessIncomingAudioPacket(const uint8_t* data, si
     nonce[10] = data[3];
     nonce[11] = data[4];
 
+    uint32_t sequence = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                        ((uint32_t)data[3] << 8) | (uint32_t)data[4];
+
     int sample_rate = (data[9] == 0) ? 44100 : 48000;
     int channels = (int)data[10];
     if (channels <= 0) channels = 1;
@@ -680,7 +683,7 @@ void WindowsAudioRelayServer::ProcessIncomingAudioPacket(const uint8_t* data, si
     );
 
     if (ok) {
-        render_.WritePcmChunk(plaintext.data(), plaintext.size(), channels, sample_rate);
+        render_.WritePcmChunk(sequence, plaintext.data(), plaintext.size(), channels, sample_rate);
     }
 }
 

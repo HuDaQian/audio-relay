@@ -35,8 +35,13 @@ mDNS/DNS-SD, described in §5.
 The desktop app (macOS / Windows) advertises a service:
 
 - **Service type:** `_audiorelay._udp.local.`
-- **Port:** the TCP control port (audio's UDP port is sent separately in
-  `HELLO`, see §4.1 — mDNS only needs to get the phone to the control port).
+- **Port:** the TCP control port (`45108` by default). The audio path depends
+  on the negotiated stream mode:
+  - `speaker`: the phone binds its own UDP `audio_port` and advertises it in
+    `HELLO`; the desktop sends audio to `(tcp_peer_ip, audio_port)`.
+  - `microphone`: the phone sends audio to the desktop's fixed UDP port
+    `45108` (the same socket the desktop uses to send audio in speaker mode).
+    This is currently a fixed port rather than negotiated — see §4.1.
 - **TXT record keys:**
   - `id` — a stable device ID (UUIDv4 on macOS, unique ID on Windows, generated once
     and persisted in `config.json`).

@@ -128,10 +128,7 @@ bool WasapiRender::Start(const std::string& device_id) {
         ResetEvent(stop_event_);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        sample_queue_.clear();
-    }
+    jitter_.reset();
 
     worker_thread_ = std::thread(&WasapiRender::RenderLoop, this, device_id);
     return true;
@@ -142,14 +139,13 @@ void WasapiRender::Stop() {
     if (stop_event_) {
         SetEvent(stop_event_);
     }
-    queue_cv_.notify_all();
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
     is_running_.store(false);
 }
 
-void WasapiRender::WritePcmChunk(const uint8_t* pcm, size_t size, int channels, int sample_rate) {
+void WasapiRender::WritePcmChunk(uint32_t sequence, const uint8_t* pcm, size_t size, int channels, int sample_rate) {
     if (!is_running_.load() || size == 0) return;
 
     // Convert incoming 16-bit PCM bytes to mono int16 samples
@@ -157,9 +153,9 @@ void WasapiRender::WritePcmChunk(const uint8_t* pcm, size_t size, int channels, 
     const int16_t* in_samples = reinterpret_cast<const int16_t*>(pcm);
 
     std::vector<int16_t> mono_samples;
-    mono_samples.reserve(sample_count / channels);
+    mono_samples.reserve(sample_count / std::max(1, channels));
 
-    if (channels == 1) {
+    if (channels <= 1) {
         mono_samples.assign(in_samples, in_samples + sample_count);
     } else {
         // Downmix stereo to mono
@@ -175,33 +171,24 @@ void WasapiRender::WritePcmChunk(const uint8_t* pcm, size_t size, int channels, 
         target_rate = mix_format_->nSamplesPerSec;
     }
 
-    std::vector<int16_t> resampled_samples;
+    std::vector<int16_t> resampled;
     if (sample_rate > 0 && sample_rate != target_rate && !mono_samples.empty()) {
         double ratio = (double)target_rate / (double)sample_rate;
         size_t out_count = (size_t)(mono_samples.size() * ratio);
-        resampled_samples.resize(out_count);
+        resampled.resize(out_count);
         for (size_t i = 0; i < out_count; i++) {
             double src_idx = i / ratio;
             size_t idx0 = (size_t)src_idx;
             size_t idx1 = std::min(idx0 + 1, mono_samples.size() - 1);
             double frac = src_idx - idx0;
             double interpolated = mono_samples[idx0] * (1.0 - frac) + mono_samples[idx1] * frac;
-            resampled_samples[i] = (int16_t)std::clamp(interpolated, -32768.0, 32767.0);
+            resampled[i] = (int16_t)std::clamp(interpolated, -32768.0, 32767.0);
         }
     } else {
-        resampled_samples = std::move(mono_samples);
+        resampled = std::move(mono_samples);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        // Bound buffer size to max 1 second of audio to prevent delay accumulation
-        size_t max_queue = target_rate > 0 ? target_rate : 48000;
-        if (sample_queue_.size() > max_queue) {
-            sample_queue_.erase(sample_queue_.begin(), sample_queue_.begin() + (sample_queue_.size() - (max_queue / 2)));
-        }
-        sample_queue_.insert(sample_queue_.end(), resampled_samples.begin(), resampled_samples.end());
-    }
-    queue_cv_.notify_one();
+    jitter_.push(sequence, resampled.data(), resampled.size());
 }
 
 void WasapiRender::RenderLoop(std::string device_id) {
@@ -329,21 +316,10 @@ void WasapiRender::RenderLoop(std::string device_id) {
         hr = render_client_->GetBuffer(framesAvailable, &pData);
         if (FAILED(hr)) break;
 
-        std::vector<int16_t> samplesToPlay;
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            if (sample_queue_.empty()) {
-                queue_cv_.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-                    return !sample_queue_.empty() || should_stop_.load();
-                });
-            }
-
-            size_t take = std::min((size_t)framesAvailable, sample_queue_.size());
-            if (take > 0) {
-                samplesToPlay.assign(sample_queue_.begin(), sample_queue_.begin() + take);
-                sample_queue_.erase(sample_queue_.begin(), sample_queue_.begin() + take);
-            }
-        }
+        // Zero-filled: frames `pop` doesn't fill stay silent (pre-buffer /
+        // concealment / underflow).
+        std::vector<int16_t> samplesToPlay(framesAvailable, 0);
+        jitter_.pop(samplesToPlay.data(), framesAvailable);
 
         // Fill buffer
         if (isFloat) {

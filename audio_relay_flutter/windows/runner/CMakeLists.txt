@@ -14,6 +14,7 @@ add_executable(${BINARY_NAME} WIN32
   "crypto.cpp"
   "wasapi_capture.cpp"
   "wasapi_render.cpp"
+  "jitter_buffer.cpp"
   "audio_relay_server.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"

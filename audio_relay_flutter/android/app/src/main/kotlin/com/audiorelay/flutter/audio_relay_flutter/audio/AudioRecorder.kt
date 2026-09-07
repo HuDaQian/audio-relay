@@ -20,6 +20,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Captures microphone audio using [AudioRecord] at 48kHz 16-bit PCM.
  * Automatically engages hardware [AcousticEchoCanceler] and [NoiseSuppressor] when available.
  * Delivers PCM chunks (typically 10-20ms) via a high-performance callback.
+ *
+ * NOTE: In one-way "microphone mode" the phone plays nothing, so
+ * [AcousticEchoCanceler] has no far-end reference signal and cannot actually
+ * cancel anything. It is attached only as a no-op best-effort. The real
+ * far-end echo (the phone's mic picking up the computer's speakers) is
+ * mitigated by telling the user to wear headphones — see the microphone-mode
+ * guidance in the UI. AEC becomes meaningful only in future full-duplex mode.
  */
 class AudioRecorder(
     private val sampleRate: Int = 48000,
