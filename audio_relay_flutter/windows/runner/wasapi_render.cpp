@@ -295,7 +295,6 @@ void WasapiRender::RenderLoop(std::string device_id) {
 
     is_running_.store(true);
 
-    const int outSampleRate = mix_format_->nSamplesPerSec;
     const int outChannels = mix_format_->nChannels;
     const bool isFloat = (mix_format_->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
         ((mix_format_->wFormatTag == WAVE_FORMAT_EXTENSIBLE) &&
