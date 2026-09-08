@@ -1275,18 +1275,16 @@ class MacAudioRelayServer {
             os_log("Relay sent frame #%d (%d bytes PCM -> %d bytes encrypted)", seq, pcm.count, datagram.count)
         }
 
-        // 1. Send to UDP client (if LAN / Wi-Fi)
-        if let udp = udpConn {
-            udp.send(content: datagram, completion: .idempotent)
-        }
-
-        // 2. Send to TCP client (if USB cable / ADB reverse) with 2-byte length prefix
+        // 1. Send to TCP client (if USB cable / ADB reverse) with 2-byte length prefix
         if let tcp = tcpConn {
             var lengthPrefixed = Data(count: 2)
             var lenBE = UInt16(datagram.count).bigEndian
             withUnsafeBytes(of: &lenBE) { lengthPrefixed.replaceSubrange(0..<2, with: $0) }
             lengthPrefixed.append(datagram)
             tcp.send(content: lengthPrefixed, completion: .idempotent)
+        } else if let udp = udpConn {
+            // 2. Fall back to UDP client (LAN / Wi-Fi) only when USB TCP is not active
+            udp.send(content: datagram, completion: .idempotent)
         }
     }
 }

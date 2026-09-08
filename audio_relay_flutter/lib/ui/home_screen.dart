@@ -407,7 +407,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      '音量电平: ${(level * 100).toInt()}%',
+                      isMic || isDuplex ? '麦克风输入电平: ${(level * 100).toInt()}%' : '接收播放音量: ${(level * 100).toInt()}%',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ],
