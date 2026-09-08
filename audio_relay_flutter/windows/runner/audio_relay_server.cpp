@@ -704,13 +704,28 @@ void WindowsAudioRelayServer::ProcessIncomingAudioPacket(const uint8_t* data, si
 }
 
 void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
-    std::lock_guard<std::mutex> lock(net_mutex_);
-
-    if (session_key_.size() != 32 || session_id_.size() != 8) {
-        return;
+    // Snapshot the per-session state under the lock, then encrypt and send
+    // outside it. A blocked TCP send() must not stall the microphone receive
+    // path (ProcessIncomingAudioPacket) or the control channel, both of which
+    // also need net_mutex_.
+    std::vector<uint8_t> key;
+    std::vector<uint8_t> session_id;
+    uint32_t sequence;
+    bool has_udp;
+    sockaddr_in udp_addr{};
+    SOCKET tcp_sock;
+    {
+        std::lock_guard<std::mutex> lock(net_mutex_);
+        if (session_key_.size() != 32 || session_id_.size() != 8) {
+            return;
+        }
+        key = session_key_;
+        session_id = session_id_;
+        sequence = ++sequence_;
+        has_udp = has_active_udp_;
+        udp_addr = active_udp_addr_;
+        tcp_sock = active_audio_tcp_sock_;
     }
-
-    sequence_++;
 
     // Monotonic timestamp in milliseconds
     static const auto start_time = std::chrono::steady_clock::now();
@@ -726,10 +741,10 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     // [11..12] = 0x0000 (reserved)
     uint8_t header[13];
     header[0] = 0x00;
-    header[1] = (uint8_t)(sequence_ >> 24);
-    header[2] = (uint8_t)(sequence_ >> 16);
-    header[3] = (uint8_t)(sequence_ >> 8);
-    header[4] = (uint8_t)(sequence_);
+    header[1] = (uint8_t)(sequence >> 24);
+    header[2] = (uint8_t)(sequence >> 16);
+    header[3] = (uint8_t)(sequence >> 8);
+    header[4] = (uint8_t)(sequence);
 
     header[5] = (uint8_t)(ts_ms >> 24);
     header[6] = (uint8_t)(ts_ms >> 16);
@@ -743,7 +758,7 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
 
     // Nonce (12 bytes): session_id (8B) + sequence_be (4B)
     uint8_t nonce[12];
-    std::memcpy(nonce, session_id_.data(), 8);
+    std::memcpy(nonce, session_id.data(), 8);
     nonce[8] = header[1];
     nonce[9] = header[2];
     nonce[10] = header[3];
@@ -753,7 +768,7 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     std::vector<uint8_t> ciphertext(pcm.size());
     uint8_t tag[16];
     chacha20_poly1305_seal(
-        session_key_.data(),
+        key.data(),
         nonce,
         header, 13,
         pcm.data(), pcm.size(),
@@ -769,23 +784,28 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     datagram.insert(datagram.end(), tag, tag + 16);
 
     // 1. Send over UDP (Wi-Fi)
-    if (has_active_udp_ && udp_sock_ != INVALID_SOCKET) {
+    if (has_udp && udp_sock_ != INVALID_SOCKET) {
         sendto(udp_sock_, (const char*)datagram.data(), (int)datagram.size(), 0,
-               (sockaddr*)&active_udp_addr_, sizeof(active_udp_addr_));
+               (sockaddr*)&udp_addr, sizeof(udp_addr));
     }
 
     // 2. Send over TCP (USB ADB cable) with 2-byte length prefix
-    if (active_audio_tcp_sock_ != INVALID_SOCKET) {
+    if (tcp_sock != INVALID_SOCKET) {
         uint16_t len = (uint16_t)datagram.size();
         uint8_t len_prefix[2];
         len_prefix[0] = (uint8_t)(len >> 8);
         len_prefix[1] = (uint8_t)(len & 0xFF);
 
-        int sent1 = send(active_audio_tcp_sock_, (const char*)len_prefix, 2, 0);
-        int sent2 = send(active_audio_tcp_sock_, (const char*)datagram.data(), (int)datagram.size(), 0);
+        int sent1 = send(tcp_sock, (const char*)len_prefix, 2, 0);
+        int sent2 = send(tcp_sock, (const char*)datagram.data(), (int)datagram.size(), 0);
         if (sent1 <= 0 || sent2 <= 0) {
-            closesocket(active_audio_tcp_sock_);
-            active_audio_tcp_sock_ = INVALID_SOCKET;
+            // The peer went away. Close the snapshot handle; if it is still the
+            // current one, clear the member under the lock.
+            closesocket(tcp_sock);
+            std::lock_guard<std::mutex> lock(net_mutex_);
+            if (active_audio_tcp_sock_ == tcp_sock) {
+                active_audio_tcp_sock_ = INVALID_SOCKET;
+            }
         }
     }
 }
