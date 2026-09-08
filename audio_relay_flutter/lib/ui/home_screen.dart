@@ -324,7 +324,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      '建议连接耳机进行全双工通话，避免外放回声。系统已开启硬件级回声消除与降噪。',
+                      '建议连接耳机进行全双工通话，避免外放回声。已尽力启用硬件回声消除/降噪（效果因设备而异）。',
                       style: TextStyle(fontSize: 12, color: Colors.amber.shade900),
                     ),
                   ),

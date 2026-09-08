@@ -783,8 +783,10 @@ void WindowsAudioRelayServer::SendAudioFrame(const std::vector<uint8_t>& pcm) {
     datagram.insert(datagram.end(), ciphertext.begin(), ciphertext.end());
     datagram.insert(datagram.end(), tag, tag + 16);
 
-    // 1. Send over UDP (Wi-Fi)
-    if (has_udp && udp_sock_ != INVALID_SOCKET) {
+    // 1. Send over UDP (Wi-Fi), but only when no USB TCP audio channel is
+    // active — the phone reads from exactly one transport, and sending both
+    // would just waste bandwidth (and double the speaker path on USB).
+    if (has_udp && udp_sock_ != INVALID_SOCKET && tcp_sock == INVALID_SOCKET) {
         sendto(udp_sock_, (const char*)datagram.data(), (int)datagram.size(), 0,
                (sockaddr*)&udp_addr, sizeof(udp_addr));
     }
