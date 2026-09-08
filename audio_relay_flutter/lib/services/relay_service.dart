@@ -94,11 +94,17 @@ class RelayPlatformService {
 
   Future<void> connect(String host, int port, {RelayMode mode = RelayMode.speaker}) async {
     if (!Platform.isAndroid) return;
+    String modeStr = 'speaker';
+    if (mode == RelayMode.microphone) {
+      modeStr = 'microphone';
+    } else if (mode == RelayMode.duplex) {
+      modeStr = 'duplex';
+    }
     try {
       await _methodChannel.invokeMethod('connect', {
         'host': host,
         'port': port,
-        'mode': mode == RelayMode.microphone ? 'microphone' : 'speaker',
+        'mode': modeStr,
       });
     } catch (e) {
       debugPrint('connect error: $e');

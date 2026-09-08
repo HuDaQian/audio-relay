@@ -245,6 +245,9 @@ void WindowsAudioRelayServer::Start() {
 
     if (stream_mode_ == "microphone") {
         render_.Start(selected_output_device_);
+    } else if (stream_mode_ == "duplex") {
+        TriggerStartCapture();
+        render_.Start(selected_output_device_);
     } else {
         TriggerStartCapture();
     }
@@ -301,7 +304,10 @@ void WindowsAudioRelayServer::SetStreamMode(const std::string& mode) {
 
     // Do stop and start outside of any mutex to avoid deadlocks with threads trying to acquire locks
     if (mode == "microphone") {
-        capture_.Stop(); // Thread join happens here safely outside mutex
+        capture_.Stop();
+        render_.Start(chosen_device);
+    } else if (mode == "duplex") {
+        TriggerStartCapture();
         render_.Start(chosen_device);
     } else {
         render_.Stop();
@@ -321,7 +327,7 @@ void WindowsAudioRelayServer::SetOutputDevice(const std::string& device_id) {
         selected_output_device_ = device_id;
         cur_mode = stream_mode_;
     }
-    if (cur_mode == "microphone" && render_.IsRunning()) {
+    if ((cur_mode == "microphone" || cur_mode == "duplex") && render_.IsRunning()) {
         render_.Stop();
         render_.Start(device_id);
     }
@@ -486,6 +492,10 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         capture_.Stop();
                         render_.Start(GetSelectedOutputDevice());
                         SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":1,\"stream_mode\":\"microphone\"}");
+                    } else if (cur_mode == "duplex") {
+                        TriggerStartCapture();
+                        render_.Start(GetSelectedOutputDevice());
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2,\"stream_mode\":\"duplex\"}");
                     } else {
                         render_.Stop();
                         TriggerStartCapture();
@@ -539,6 +549,10 @@ void WindowsAudioRelayServer::HandleControlClient(SOCKET client_sock, sockaddr_i
                         capture_.Stop();
                         render_.Start(GetSelectedOutputDevice());
                         SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":1,\"stream_mode\":\"microphone\"}");
+                    } else if (cur_mode == "duplex") {
+                        TriggerStartCapture();
+                        render_.Start(GetSelectedOutputDevice());
+                        SendJson(client_sock, "{\"type\":\"CAPABILITIES\",\"sample_rate\":48000,\"channels\":2,\"stream_mode\":\"duplex\"}");
                     } else {
                         render_.Stop();
                         TriggerStartCapture();
@@ -611,7 +625,8 @@ void WindowsAudioRelayServer::TcpAudioLoop() {
                 std::vector<uint8_t> pkt(pkt_len);
                 int recvd = recv(sock, (char*)pkt.data(), pkt_len, MSG_WAITALL);
                 if (recvd != pkt_len) break;
-                if (GetStreamMode() == "microphone") {
+                std::string mode = GetStreamMode();
+                if (mode == "microphone" || mode == "duplex") {
                     ProcessIncomingAudioPacket(pkt.data(), pkt.size());
                 }
             }
@@ -633,7 +648,8 @@ void WindowsAudioRelayServer::UdpAudioReceiveLoop() {
             continue;
         }
 
-        if (GetStreamMode() == "microphone") {
+        std::string mode = GetStreamMode();
+        if (mode == "microphone" || mode == "duplex") {
             ProcessIncomingAudioPacket(buffer.data(), (size_t)n);
         }
     }

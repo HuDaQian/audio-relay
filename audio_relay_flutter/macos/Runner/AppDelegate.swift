@@ -799,6 +799,10 @@ class MacAudioRelayServer {
             setCapturingState(false)
             let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
             player.start(deviceUID: targetUID)
+        } else if mode == "duplex" {
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+            triggerStartCapture()
         } else {
             player.stop()
             triggerStartCapture()
@@ -842,10 +846,11 @@ class MacAudioRelayServer {
             return
         }
 
-        if streamMode == "microphone" {
+        if streamMode == "microphone" || streamMode == "duplex" {
             // The Android microphone sender always transmits mono 16-bit PCM.
             let samples = decrypted.withUnsafeBytes { raw -> [Int16] in
-                let p = raw.bindMemory(to: Int16.self)
+                guard let baseAddr = raw.baseAddress else { return [] }
+                let p = baseAddr.bindMemory(to: Int16.self, capacity: raw.count / 2)
                 return Array(UnsafeBufferPointer(start: p, count: raw.count / 2))
             }
             player.pushPcm(sequence, mono: samples)
@@ -1155,6 +1160,10 @@ class MacAudioRelayServer {
         if streamMode == "microphone" {
             let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
             player.start(deviceUID: targetUID)
+        } else if streamMode == "duplex" {
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+            triggerStartCapture()
         } else {
             triggerStartCapture()
         }
@@ -1206,6 +1215,10 @@ class MacAudioRelayServer {
         if streamMode == "microphone" {
             let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
             player.start(deviceUID: targetUID)
+        } else if streamMode == "duplex" {
+            let targetUID = selectedOutputDeviceUID ?? autoDetectVirtualDevice()
+            player.start(deviceUID: targetUID)
+            triggerStartCapture()
         } else {
             triggerStartCapture()
         }

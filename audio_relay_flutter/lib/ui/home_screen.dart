@@ -125,15 +125,25 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _setDesktopMode(RelayMode mode) async {
     setState(() {
       _currentMode = mode;
-      _desktopStatus = mode == RelayMode.microphone
-          ? '麦克风接收服务运行中 (等待设备连接)'
-          : '音频广播服务运行中 (等待设备连接)';
+      if (mode == RelayMode.duplex) {
+        _desktopStatus = '全双工服务运行中 (广播与麦克风同时工作)';
+      } else if (mode == RelayMode.microphone) {
+        _desktopStatus = '麦克风接收服务运行中 (等待设备连接)';
+      } else {
+        _desktopStatus = '音频广播服务运行中 (等待设备连接)';
+      }
     });
     try {
-      await _desktopChannel.invokeMethod('setStreamMode', {
-        'mode': mode == RelayMode.microphone ? 'microphone' : 'speaker',
-      });
+      String modeStr = 'speaker';
       if (mode == RelayMode.microphone) {
+        modeStr = 'microphone';
+      } else if (mode == RelayMode.duplex) {
+        modeStr = 'duplex';
+      }
+      await _desktopChannel.invokeMethod('setStreamMode', {
+        'mode': modeStr,
+      });
+      if (mode == RelayMode.microphone || mode == RelayMode.duplex) {
         await _fetchDesktopDevices();
       }
     } catch (e) {
@@ -277,12 +287,17 @@ class _HomeScreenState extends State<HomeScreen> {
               ButtonSegment<RelayMode>(
                 value: RelayMode.speaker,
                 icon: Icon(Icons.headphones_rounded),
-                label: Text('扬声器模式'),
+                label: Text('扬声器'),
               ),
               ButtonSegment<RelayMode>(
                 value: RelayMode.microphone,
                 icon: Icon(Icons.mic_rounded),
-                label: Text('麦克风模式'),
+                label: Text('麦克风'),
+              ),
+              ButtonSegment<RelayMode>(
+                value: RelayMode.duplex,
+                icon: Icon(Icons.sync_alt_rounded),
+                label: Text('全双工通话'),
               ),
             ],
             selected: {_currentMode},
@@ -293,6 +308,30 @@ class _HomeScreenState extends State<HomeScreen> {
             },
           ),
         ),
+        if (_currentMode == RelayMode.duplex)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.amber.shade300),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline_rounded, color: Colors.amber.shade800, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '建议连接耳机进行全双工通话，避免外放回声。系统已开启硬件级回声消除与降噪。',
+                      style: TextStyle(fontSize: 12, color: Colors.amber.shade900),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         Expanded(
           child: ValueListenableBuilder<ConnectionStatus>(
             valueListenable: _service.statusNotifier,
@@ -312,6 +351,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildStreamingView(ConnectionStatus status) {
     final isMic = _currentMode == RelayMode.microphone;
+    final isDuplex = _currentMode == RelayMode.duplex;
+
+    IconData iconData = Icons.headphones_rounded;
+    String statusTitle = '正在接收音频';
+    if (isDuplex) {
+      iconData = Icons.sync_alt_rounded;
+      statusTitle = '全双工音频传输中 (听音+麦克风)';
+    } else if (isMic) {
+      iconData = Icons.mic_rounded;
+      statusTitle = '正在传输麦克风音频';
+    }
+
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24.0),
@@ -319,20 +370,21 @@ class _HomeScreenState extends State<HomeScreen> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(
-              isMic ? Icons.mic_rounded : Icons.headphones_rounded,
+              iconData,
               size: 72,
               color: Colors.green,
             ),
             const SizedBox(height: 16),
             Text(
-              isMic ? '正在传输麦克风音频' : '正在接收音频',
+              statusTitle,
               style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                     fontWeight: FontWeight.bold,
                   ),
+              textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
             Text(
-              isMic ? '目标：${status.deviceName ?? "电脑"}' : '来源：${status.deviceName ?? "电脑"}',
+              '电脑：${status.deviceName ?? "电脑"}',
               style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                     color: Colors.grey[700],
                   ),
@@ -639,12 +691,17 @@ class _HomeScreenState extends State<HomeScreen> {
                         ButtonSegment<RelayMode>(
                           value: RelayMode.speaker,
                           icon: Icon(Icons.headphones_rounded),
-                          label: Text('电脑扬声器中继 (发送)'),
+                          label: Text('电脑扬声器中继'),
                         ),
                         ButtonSegment<RelayMode>(
                           value: RelayMode.microphone,
                           icon: Icon(Icons.mic_rounded),
-                          label: Text('手机做麦克风 (接收)'),
+                          label: Text('手机做麦克风'),
+                        ),
+                        ButtonSegment<RelayMode>(
+                          value: RelayMode.duplex,
+                          icon: Icon(Icons.sync_alt_rounded),
+                          label: Text('全双工 (通话/开黑)'),
                         ),
                       ],
                       selected: {_currentMode},
@@ -677,7 +734,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(height: 16),
                   const Text('音频中继端口：45108 (TCP 控制 / UDP 音频) | 45109 (TCP 串流)'),
 
-                  if (_currentMode == RelayMode.speaker) ...[
+                  if (_currentMode == RelayMode.speaker || _currentMode == RelayMode.duplex) ...[
+                    const SizedBox(height: 8),
                     const Text('捕获后端：ScreenCaptureKit (macOS) / WASAPI (Windows)'),
                     const SizedBox(height: 8),
                     Wrap(
@@ -719,7 +777,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         ],
                       ],
                     ),
-                  ] else ...[
+                  ],
+                  if (_currentMode == RelayMode.microphone || _currentMode == RelayMode.duplex) ...[
                     const SizedBox(height: 8),
                     // Virtual device selector
                     Text(

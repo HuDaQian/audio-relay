@@ -553,48 +553,21 @@ class RelayService : Service() {
                 RelayState.setStatus(ConnectionStatus.STREAMING)
                 RelayState.setConnectedDeviceName(paired.laptopDeviceName)
                 updateNotification(paired.laptopDeviceName)
-                reconnectAttempt = 0
+                val isMicNeeded = (streamMode == "microphone" || streamMode == "duplex")
+                val isSpeakerNeeded = (streamMode == "speaker" || streamMode == "duplex")
 
-                if (streamMode == "microphone") {
-                    val targetAddr = withContext(Dispatchers.IO) { InetAddress.getByName(laptop.host) }
-                    var tcpOut: java.io.OutputStream? = null
-                    if (laptop.host == "127.0.0.1") {
-                        try {
-                            val s = Socket()
-                            s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
-                            s.tcpNoDelay = true
-                            audioTcpSocket = s
-                            tcpOut = s.getOutputStream()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "TCP mic socket connect failed, fallback to UDP", e)
-                        }
+                if (laptop.host == "127.0.0.1") {
+                    try {
+                        val s = Socket()
+                        s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
+                        s.tcpNoDelay = true
+                        audioTcpSocket = s
+                    } catch (e: Exception) {
+                        Log.w(TAG, "TCP audio connect failed: ${e.message}, falling back to UDP", e)
                     }
+                }
 
-                    val sender = MicAudioSender(
-                        sessionKey = paired.sessionKey,
-                        sessionId = paired.sessionId,
-                        targetAddress = targetAddr,
-                        targetUdpPort = 45108,
-                        tcpOutputStream = tcpOut,
-                        sampleRateHz = paired.sampleRateHz,
-                        channels = paired.channels,
-                    ).also {
-                        micSender = it
-                        activeMicSender = it
-                    }
-
-                    val rec = AudioRecorder(
-                        sampleRate = paired.sampleRateHz,
-                        channels = paired.channels,
-                        onPcmChunk = { pcm, len -> sender.sendChunk(pcm, len) },
-                        onAudioLevel = { level -> RelayState.setPlaybackLevel(level) },
-                    ).also {
-                        recorder = it
-                        activeRecorder = it
-                    }
-                    rec.start(serviceScope)
-                    activeChannel.heartbeatLoop()
-                } else {
+                if (isSpeakerNeeded) {
                     val preferredDevice = settings.preferredOutputDeviceKey?.let { outputDevices.findByKey(it) }
                     sessionReceiver?.configureSession(
                         sessionKey = paired.sessionKey,
@@ -605,23 +578,45 @@ class RelayService : Service() {
                         preferredOutputDevice = preferredDevice,
                     )
 
-                    if (laptop.host == "127.0.0.1") {
-                        try {
-                            val s = Socket()
-                            s.connect(InetSocketAddress("127.0.0.1", 45109), 3000)
-                            s.tcpNoDelay = true
-                            audioTcpSocket = s
-                            launch { sessionReceiver?.receiveTcpLoop(s.getInputStream()) }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "TCP audio connect failed: ${e.message}, falling back to UDP", e)
-                            launch { sessionReceiver?.receiveLoop() }
-                        }
+                    val tcpIn = audioTcpSocket?.getInputStream()
+                    if (tcpIn != null) {
+                        launch { sessionReceiver?.receiveTcpLoop(tcpIn) }
                     } else {
                         launch { sessionReceiver?.receiveLoop() }
                     }
                     launch { sessionReceiver?.playbackLoop() }
-                    activeChannel.heartbeatLoop()
                 }
+
+                if (isMicNeeded) {
+                    val targetAddr = withContext(Dispatchers.IO) { InetAddress.getByName(laptop.host) }
+                    val tcpOut = audioTcpSocket?.getOutputStream()
+
+                    val sender = MicAudioSender(
+                        sessionKey = paired.sessionKey,
+                        sessionId = paired.sessionId,
+                        targetAddress = targetAddr,
+                        targetUdpPort = 45108,
+                        tcpOutputStream = tcpOut,
+                        sampleRateHz = paired.sampleRateHz,
+                        channels = 1,
+                    ).also {
+                        micSender = it
+                        activeMicSender = it
+                    }
+
+                    val rec = AudioRecorder(
+                        sampleRate = paired.sampleRateHz,
+                        channels = 1,
+                        onPcmChunk = { pcm, len -> sender.sendChunk(pcm, len) },
+                        onAudioLevel = { level -> RelayState.setPlaybackLevel(level) },
+                    ).also {
+                        recorder = it
+                        activeRecorder = it
+                    }
+                    rec.start(serviceScope)
+                }
+
+                activeChannel.heartbeatLoop()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

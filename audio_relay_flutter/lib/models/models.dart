@@ -3,6 +3,7 @@ enum RelayRole { sender, receiver }
 enum RelayMode {
   speaker,
   microphone,
+  duplex,
 }
 
 enum ConnectionStateType {
